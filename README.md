@@ -1,10 +1,10 @@
-# ACE-Step for Intel XPU (Arc GPUs)
+# ACE-Step-1.5 for Intel XPU (Arc GPUs)
 
 ![Intel Arc](https://img.shields.io/badge/Intel-Arc%20GPU-blue)
 ![PyTorch](https://img.shields.io/badge/PyTorch-2.11%20XPU-orange)
 ![Python](https://img.shields.io/badge/Python-3.11-green)
 
-**Optimized fork of ACE-Step for Intel Arc A-series GPUs with XPU acceleration.**
+**Optimized fork of ACE-Step-1.5 for Intel Arc A-series GPUs with XPU acceleration.**
 
 ---
 
@@ -99,7 +99,7 @@ Open your browser to: **http://127.0.0.1:7860**
 | Model | Features | Steps | Speed | Quality | Size |
 |-------|----------|-------|-------|---------|------|
 | **acestep-v15-turbo** | text2music only | 1-20 | Fast (15s) | Good | 4GB |
-| **acestep-v15** | All features | 1-200 | Slow (60s) | Best | 5GB |
+| **acestep-v15-base** | All features | 1-200 | Slow (60s) | Best | 5GB |
 | **acestep-v15-turbo-shift3** | text2music only | 1-20 | Fast (15s) | Good+ | 4GB |
 
 ### Language Models (5Hz LM)
