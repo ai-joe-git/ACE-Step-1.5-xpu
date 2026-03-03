@@ -126,6 +126,51 @@ class BatchManagementWrapperTests(unittest.TestCase):
         self.assertEqual(final_batch_queue[0]["lrcs"], lrcs)
         self.assertEqual(final_batch_queue[0]["subtitles"], subtitles)
 
+    def test_auto_lrc_sets_lrc_display_in_final_yield(self):
+        """Final yield should carry gr.update(value=lrc) at positions 36-43."""
+        module, _state = load_batch_management_module(is_windows=False)
+
+        lrcs = [f"[00:01.00]Line {idx}" for idx in range(8)]
+        subtitles = [f"sub-{idx}" for idx in range(8)]
+
+        def _gen(*_args, **_kwargs):
+            """Yield a result with LRC data in extra_outputs."""
+            result = list(build_progress_result(length=48))
+            result[46] = {"lrcs": lrcs, "subtitles": subtitles}
+            yield tuple(result)
+
+        kwargs = _build_call_kwargs(module)
+        kwargs["auto_lrc"] = True
+        with patch.dict(module.generate_with_batch_management.__globals__, {"generate_with_progress": _gen}):
+            outputs = list(module.generate_with_batch_management(None, None, **kwargs))
+
+        final_yield = outputs[-1]
+        for i in range(8):
+            lrc_val = final_yield[36 + i]
+            self.assertIsInstance(lrc_val, dict, f"LRC position {36 + i} should be a gr.update dict")
+            self.assertEqual(
+                lrc_val.get("value"), lrcs[i],
+                f"LRC position {36 + i} should contain the LRC text",
+            )
+
+    def test_auto_lrc_disabled_preserves_passthrough_values(self):
+        """When auto_lrc is off, LRC positions pass through from inner generator."""
+        module, _state = load_batch_management_module(is_windows=False)
+
+        def _gen(*_args, **_kwargs):
+            """Yield a standard result without auto_lrc."""
+            yield build_progress_result(length=48)
+
+        kwargs = _build_call_kwargs(module)
+        kwargs["auto_lrc"] = False
+        with patch.dict(module.generate_with_batch_management.__globals__, {"generate_with_progress": _gen}):
+            outputs = list(module.generate_with_batch_management(None, None, **kwargs))
+
+        final_yield = outputs[-1]
+        for i in range(8):
+            lrc_val = final_yield[36 + i]
+            self.assertIsNone(lrc_val, f"LRC position {36 + i} should be None when auto_lrc is off")
+
     def test_empty_inner_generator_returns_skip_tuple_and_warning(self):
         """Empty inner generator should fail gracefully without indexing None."""
         module, state = load_batch_management_module(is_windows=False)

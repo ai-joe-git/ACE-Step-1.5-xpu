@@ -23,10 +23,8 @@ import sys
 import time
 import traceback
 import urllib.parse
-from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
-from threading import Lock
 from typing import Any, Dict, List, Optional
 import torch
 from loguru import logger
@@ -44,7 +42,9 @@ from acestep.api.jobs.store import _JobStore
 from acestep.api.log_capture import install_log_capture
 from acestep.api.route_setup import configure_api_routes
 from acestep.api.server_cli import run_api_server_main
+from acestep.api.lifespan_runtime import initialize_lifespan_runtime
 from acestep.api.startup_model_init import initialize_models_at_startup
+from acestep.api.worker_runtime import start_worker_tasks, stop_worker_tasks
 from acestep.api.server_utils import (
     env_bool as _env_bool,
     get_model_name as _get_model_name,
@@ -71,10 +71,6 @@ from acestep.api.http.release_task_param_parser import (
 from acestep.api.jobs.local_cache_updates import (
     update_local_cache,
     update_local_cache_progress,
-)
-from acestep.api.jobs.worker_loops import (
-    process_queue_item,
-    run_job_store_cleanup_loop,
 )
 from acestep.api.runtime_helpers import (
     append_jsonl as _runtime_append_jsonl,
@@ -213,104 +209,26 @@ def create_app() -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        # Clear proxy env that may affect downstream libs
-        for proxy_var in ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"]:
-            os.environ.pop(proxy_var, None)
-
-        # Ensure compilation/temp caches do not fill up small default /tmp.
-        # Triton/Inductor (and the system compiler) can create large temporary files.
-        project_root = _get_project_root()
-        cache_root = os.path.join(project_root, ".cache", "acestep")
-        tmp_root = (os.getenv("ACESTEP_TMPDIR") or os.path.join(cache_root, "tmp")).strip()
-        triton_cache_root = (os.getenv("TRITON_CACHE_DIR") or os.path.join(cache_root, "triton")).strip()
-        inductor_cache_root = (os.getenv("TORCHINDUCTOR_CACHE_DIR") or os.path.join(cache_root, "torchinductor")).strip()
-
-        for p in [cache_root, tmp_root, triton_cache_root, inductor_cache_root]:
-            try:
-                os.makedirs(p, exist_ok=True)
-            except Exception:
-                # Best-effort: do not block startup if directory creation fails.
-                pass
-
-        # Respect explicit user overrides; if ACESTEP_TMPDIR is set, it should win.
-        if os.getenv("ACESTEP_TMPDIR"):
-            os.environ["TMPDIR"] = tmp_root
-            os.environ["TEMP"] = tmp_root
-            os.environ["TMP"] = tmp_root
-        else:
-            os.environ.setdefault("TMPDIR", tmp_root)
-            os.environ.setdefault("TEMP", tmp_root)
-            os.environ.setdefault("TMP", tmp_root)
-
-        os.environ.setdefault("TRITON_CACHE_DIR", triton_cache_root)
-        os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", inductor_cache_root)
-
-        handler = AceStepHandler()
-        llm_handler = LLMHandler()
-        init_lock = asyncio.Lock()
-        app.state._initialized = False
-        app.state._init_error = None
-        app.state._init_lock = init_lock
-
-        app.state.llm_handler = llm_handler
-        app.state._llm_initialized = False
-        app.state._llm_init_error = None
-        app.state._llm_init_lock = Lock()
-        app.state._llm_lazy_load_disabled = False  # Will be set to True if LLM skipped due to GPU config
-
-        # Multi-model support: secondary DiT handlers
-        handler2 = None
-        handler3 = None
-        config_path2 = os.getenv("ACESTEP_CONFIG_PATH2", "").strip()
-        config_path3 = os.getenv("ACESTEP_CONFIG_PATH3", "").strip()
-
-        if config_path2:
-            handler2 = AceStepHandler()
-        if config_path3:
-            handler3 = AceStepHandler()
-
-        app.state.handler2 = handler2
-        app.state.handler3 = handler3
-        app.state._initialized2 = False
-        app.state._initialized3 = False
-        app.state._config_path = os.getenv("ACESTEP_CONFIG_PATH", "acestep-v15-turbo")
-        app.state._config_path2 = config_path2
-        app.state._config_path3 = config_path3
-
-        max_workers = int(os.getenv("ACESTEP_API_WORKERS", "1"))
-        executor = ThreadPoolExecutor(max_workers=max_workers)
-
-        # Queue & observability
-        app.state.job_queue = asyncio.Queue(maxsize=QUEUE_MAXSIZE)  # (job_id, req)
-        app.state.pending_ids = deque()  # queued job_ids
-        app.state.pending_lock = asyncio.Lock()
-
-        # temp files per job (from multipart uploads)
-        app.state.job_temp_files = {}  # job_id -> list[path]
-        app.state.job_temp_files_lock = asyncio.Lock()
-
-        # stats
-        app.state.stats_lock = asyncio.Lock()
-        app.state.recent_durations = deque(maxlen=AVG_WINDOW)
-        app.state.avg_job_seconds = INITIAL_AVG_JOB_SECONDS
-
-        app.state.handler = handler
-        app.state.executor = executor
-        app.state.job_store = store
-        app.state._python_executable = sys.executable
-        initialize_training_state(app)
-
-        # Temporary directory for saving generated audio files
-        app.state.temp_audio_dir = os.path.join(tmp_root, "api_audio")
-        os.makedirs(app.state.temp_audio_dir, exist_ok=True)
-
-        # Initialize local cache
-        try:
-            from acestep.local_cache import get_local_cache
-            local_cache_dir = os.path.join(cache_root, "local_redis")
-            app.state.local_cache = get_local_cache(local_cache_dir)
-        except ImportError:
-            app.state.local_cache = None
+        runtime = initialize_lifespan_runtime(
+            app=app,
+            store=store,
+            queue_maxsize=QUEUE_MAXSIZE,
+            avg_window=AVG_WINDOW,
+            initial_avg_job_seconds=INITIAL_AVG_JOB_SECONDS,
+            get_project_root=_get_project_root,
+            initialize_training_state_fn=initialize_training_state,
+            ace_handler_cls=AceStepHandler,
+            llm_handler_cls=LLMHandler,
+        )
+        cache_root = runtime.cache_root
+        tmp_root = runtime.tmp_root
+        handler = runtime.handler
+        llm_handler = runtime.llm_handler
+        handler2 = runtime.handler2
+        handler3 = runtime.handler3
+        config_path2 = runtime.config_path2
+        config_path3 = runtime.config_path3
+        executor = runtime.executor
 
         async def _ensure_initialized() -> None:
             """Check if models are initialized (they should be loaded at startup)."""
@@ -666,7 +584,7 @@ def create_app() -> FastAPI:
                     instruction=instruction_to_use,
                     reference_audio=req.reference_audio_path,
                     src_audio=req.src_audio_path,
-                    audio_codes="",
+                    audio_codes=req.audio_code_string if req.audio_code_string else "",
                     caption=caption,
                     lyrics=lyrics,
                     instrumental=_is_instrumental(lyrics),
@@ -687,6 +605,7 @@ def create_app() -> FastAPI:
                     repainting_start=req.repainting_start,
                     repainting_end=req.repainting_end if req.repainting_end else -1,
                     audio_cover_strength=req.audio_cover_strength,
+                    cover_noise_strength=req.cover_noise_strength,
                     # LM parameters
                     thinking=thinking,  # Use LM for code generation when thinking=True
                     lm_temperature=req.lm_temperature,
@@ -1015,30 +934,14 @@ def create_app() -> FastAPI:
                     if app.state.recent_durations:
                         app.state.avg_job_seconds = sum(app.state.recent_durations) / len(app.state.recent_durations)
 
-        async def _queue_worker(worker_idx: int) -> None:
-            while True:
-                job_id, req = await app.state.job_queue.get()
-                await process_queue_item(
-                    job_id=job_id,
-                    req=req,
-                    app_state=app.state,
-                    store=store,
-                    run_one_job=_run_one_job,
-                    cleanup_job_temp_files=_cleanup_job_temp_files,
-                )
-
-        async def _job_store_cleanup_worker() -> None:
-            """Background task to periodically clean up old completed jobs."""
-            await run_job_store_cleanup_loop(
-                store=store,
-                cleanup_interval_seconds=JOB_STORE_CLEANUP_INTERVAL,
-            )
-
-        worker_count = max(1, WORKER_COUNT)
-        workers = [asyncio.create_task(_queue_worker(i)) for i in range(worker_count)]
-        cleanup_task = asyncio.create_task(_job_store_cleanup_worker())
-        app.state.worker_tasks = workers
-        app.state.cleanup_task = cleanup_task
+        workers, cleanup_task = start_worker_tasks(
+            app_state=app.state,
+            store=store,
+            worker_count=WORKER_COUNT,
+            run_one_job=_run_one_job,
+            cleanup_job_temp_files=_cleanup_job_temp_files,
+            cleanup_interval_seconds=JOB_STORE_CLEANUP_INTERVAL,
+        )
         initialize_models_at_startup(
             app=app,
             handler=handler,
@@ -1055,10 +958,11 @@ def create_app() -> FastAPI:
         try:
             yield
         finally:
-            cleanup_task.cancel()
-            for t in workers:
-                t.cancel()
-            executor.shutdown(wait=False, cancel_futures=True)
+            stop_worker_tasks(
+                workers=workers,
+                cleanup_task=cleanup_task,
+                executor=executor,
+            )
 
     app = FastAPI(title="ACE-Step API", version="1.0", lifespan=lifespan)
 

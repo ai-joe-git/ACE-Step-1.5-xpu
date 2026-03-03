@@ -153,10 +153,17 @@ def generate_with_batch_management(
     can_prev, can_next = update_navigation_buttons(current_batch_index, total_batches)
     next_batch_status_text = t("messages.autogen_enabled") if autogen_checkbox else ""
 
-    ui_core = _extract_ui_core_outputs(result)
-    logger.info(f"[generate_with_batch_management] Final yield: {len(ui_core)} core + 9 state")
+    ui_core_list = list(_extract_ui_core_outputs(result))
 
-    yield tuple(ui_core) + (
+    if auto_lrc and isinstance(extra_outputs_from_result, dict):
+        lrcs = extra_outputs_from_result.get("lrcs", [""] * 8)
+        for i in range(min(8, len(lrcs))):
+            if lrcs[i]:
+                ui_core_list[36 + i] = gr.update(value=lrcs[i], visible=True)
+
+    logger.info(f"[generate_with_batch_management] Final yield: {len(ui_core_list)} core + 9 state")
+
+    yield tuple(ui_core_list) + (
         current_batch_index, total_batches, batch_queue, next_params,
         batch_indicator_text,
         gr.update(interactive=can_prev),
