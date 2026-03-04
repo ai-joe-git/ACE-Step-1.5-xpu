@@ -51,6 +51,13 @@ class GenerateMusicMixin:
         if not torch.cuda.is_available():
             return None
 
+        if getattr(self, "offload_to_cpu", False):
+            logger.debug(
+                "[generate_music] VRAM pre-flight: skipping check "
+                "(offload_to_cpu=True, models loaded one-at-a-time)"
+            )
+            return None
+
         duration_s = audio_duration or 60.0
         # CFG doubles forward-pass memory: two DiT evaluations per step.
         dit_key = "base" if guidance_scale > 1.0 else "turbo"
