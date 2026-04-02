@@ -10,6 +10,7 @@
 - [Quick Start (All Platforms)](#quick-start-all-platforms)
 - [Launch Scripts](#-launch-scripts)
 - [Windows Portable Package](#-windows-portable-package)
+- [macOS Portable Package](#-macos-portable-package)
 - [AMD / ROCm GPUs](#amd--rocm-gpus)
 - [Intel GPUs](#intel-gpus)
 - [CPU-Only Mode](#cpu-only-mode)
@@ -356,6 +357,55 @@ Features: 10s timeout protection, smart conflict detection & backup, automatic r
 
 ---
 
+## 🍎 macOS Portable Package
+
+For macOS users (Apple Silicon), we provide a portable package with pre-installed dependencies:
+
+1. Download and extract: [ACE-Step-1.5.zip](https://files.acemusic.ai/acemusic/mac/ACE-Step-1.5.zip)
+2. The package includes all dependencies pre-installed with MLX backend support
+3. **Requirements:** Apple Silicon (M1/M2/M3/M4) with macOS
+
+### Quick Start Scripts
+
+| Script | Description |
+|--------|-------------|
+| `start_gradio_ui_macos.sh` | Launch Gradio Web UI (MLX) |
+| `start_api_server_macos.sh` | Launch REST API Server (MLX) |
+
+```bash
+# Make executable (first time only)
+chmod +x start_gradio_ui_macos.sh start_api_server_macos.sh
+
+# Launch Gradio Web UI with MLX backend
+./start_gradio_ui_macos.sh
+
+# Launch REST API Server with MLX backend
+./start_api_server_macos.sh
+```
+
+The macOS scripts automatically set `ACESTEP_LM_BACKEND=mlx` and `--backend mlx` for native Apple Silicon acceleration.
+
+### Configuration
+
+Configurable options are defined as variables at the top of each script. Open the script with a text editor to customize:
+
+```bash
+# UI language (en, zh, he, ja)
+LANGUAGE="en"
+
+# Download source (auto, huggingface, modelscope)
+DOWNLOAD_SOURCE="--download-source auto"
+
+# Git update check (true/false)
+CHECK_UPDATE="true"
+
+# Model configuration
+CONFIG_PATH="--config_path acestep-v15-turbo"
+LM_MODEL_PATH="--lm_model_path acestep-5Hz-lm-1.7B"
+```
+
+---
+
 ## AMD / ROCm GPUs
 
 > ⚠️ `uv run acestep` installs CUDA PyTorch wheels and may overwrite an existing ROCm setup.
@@ -600,9 +650,14 @@ python -m acestep.model_downloader --all              # Download all models
 # Main model (vae, Qwen3-Embedding-0.6B, acestep-v15-turbo, acestep-5Hz-lm-1.7B)
 huggingface-cli download ACE-Step/Ace-Step1.5 --local-dir ./checkpoints
 
-# Optional models
+# Optional LM models
 huggingface-cli download ACE-Step/acestep-5Hz-lm-0.6B --local-dir ./checkpoints/acestep-5Hz-lm-0.6B
 huggingface-cli download ACE-Step/acestep-5Hz-lm-4B --local-dir ./checkpoints/acestep-5Hz-lm-4B
+
+# XL (4B) DiT models - requires ≥12GB VRAM (with offload)
+huggingface-cli download ACE-Step/acestep-v15-xl-base --local-dir ./checkpoints/acestep-v15-xl-base
+huggingface-cli download ACE-Step/acestep-v15-xl-sft --local-dir ./checkpoints/acestep-v15-xl-sft
+huggingface-cli download ACE-Step/acestep-v15-xl-turbo --local-dir ./checkpoints/acestep-v15-xl-turbo
 ```
 
 ### Available Models
@@ -617,6 +672,9 @@ huggingface-cli download ACE-Step/acestep-5Hz-lm-4B --local-dir ./checkpoints/ac
 | acestep-v15-turbo-shift1 | Turbo DiT with shift1 | [Link](https://huggingface.co/ACE-Step/acestep-v15-turbo-shift1) |
 | acestep-v15-turbo-shift3 | Turbo DiT with shift3 | [Link](https://huggingface.co/ACE-Step/acestep-v15-turbo-shift3) |
 | acestep-v15-turbo-continuous | Turbo DiT with continuous shift (1-5) | [Link](https://huggingface.co/ACE-Step/acestep-v15-turbo-continuous) |
+| **acestep-v15-xl-base** | XL (4B) Base DiT — higher quality, ≥12GB VRAM | [Link](https://huggingface.co/ACE-Step/acestep-v15-xl-base) |
+| **acestep-v15-xl-sft** | XL (4B) SFT DiT — higher quality, ≥12GB VRAM | [Link](https://huggingface.co/ACE-Step/acestep-v15-xl-sft) |
+| **acestep-v15-xl-turbo** | XL (4B) Turbo DiT — higher quality, ≥12GB VRAM | [Link](https://huggingface.co/ACE-Step/acestep-v15-xl-turbo) |
 
 ---
 
@@ -624,13 +682,14 @@ huggingface-cli download ACE-Step/acestep-5Hz-lm-4B --local-dir ./checkpoints/ac
 
 ACE-Step automatically adapts to your GPU's VRAM. The UI pre-configures all settings (LM model, backend, offloading, quantization) based on your detected GPU tier:
 
-| Your GPU VRAM | Recommended LM Model | Backend | Notes |
-|---------------|---------------------|---------|-------|
-| **≤6GB** | None (DiT only) | — | LM disabled by default; INT8 quantization + full CPU offload |
-| **6-8GB** | `acestep-5Hz-lm-0.6B` | `pt` | Lightweight LM with PyTorch backend |
-| **8-16GB** | `0.6B` / `1.7B` | `vllm` | 0.6B for 8-12GB, 1.7B for 12-16GB |
-| **16-24GB** | `acestep-5Hz-lm-1.7B` | `vllm` | 4B available on 20GB+; no offload on 20GB+ |
-| **≥24GB** | `acestep-5Hz-lm-4B` | `vllm` | Best quality, all models fit without offload |
+| Your GPU VRAM | Recommended DiT | Recommended LM Model | Backend | Notes |
+|---------------|----------------|---------------------|---------|-------|
+| **≤6GB** | 2B turbo | None (DiT only) | — | LM disabled; INT8 quantization + full CPU offload |
+| **6-8GB** | 2B turbo | `acestep-5Hz-lm-0.6B` | `pt` | Lightweight LM with PyTorch backend |
+| **8-16GB** | 2B turbo/sft | `0.6B` / `1.7B` | `vllm` | 0.6B for 8-12GB, 1.7B for 12-16GB |
+| **16-20GB** | 2B sft or XL turbo | `acestep-5Hz-lm-1.7B` | `vllm` | XL requires CPU offload below 20GB |
+| **20-24GB** | XL turbo/sft | `acestep-5Hz-lm-1.7B` | `vllm` | XL fits without offload; 4B LM available |
+| **≥24GB** | XL sft (or xl-base for extract/lego/complete) | `acestep-5Hz-lm-4B` | `vllm` | Best quality, all models fit without offload |
 
 > 📖 For detailed GPU compatibility information (tier table, duration limits, batch sizes, adaptive UI defaults, memory optimization), see [GPU Compatibility Guide](GPU_COMPATIBILITY.md).
 

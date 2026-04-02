@@ -531,13 +531,14 @@ huggingface-cli download ACE-Step/acestep-5Hz-lm-4B --local-dir ./checkpoints/ac
 
 ACE-Step 会自动适配你的 GPU 显存。UI 会根据检测到的 GPU 等级预配置所有设置（LM 模型、后端、卸载、量化）：
 
-| GPU 显存 | 推荐 LM 模型 | 后端 | 说明 |
-|----------|--------------|------|------|
-| **≤6GB** | 无（仅 DiT） | — | 默认禁用 LM；INT8 量化 + 完全 CPU 卸载 |
-| **6-8GB** | `acestep-5Hz-lm-0.6B` | `pt` | 轻量 LM，PyTorch 后端 |
-| **8-16GB** | `0.6B` / `1.7B` | `vllm` | 8-12GB 用 0.6B，12-16GB 用 1.7B |
-| **16-24GB** | `acestep-5Hz-lm-1.7B` | `vllm` | 20GB+ 可用 4B；20GB+ 无需卸载 |
-| **≥24GB** | `acestep-5Hz-lm-4B` | `vllm` | 最佳质量，所有模型无需卸载 |
+| GPU 显存 | 推荐 DiT | 推荐 LM 模型 | 后端 | 说明 |
+|----------|---------|--------------|------|------|
+| **≤6GB** | 2B turbo | 无（仅 DiT） | — | 默认禁用 LM；INT8 量化 + 完全 CPU 卸载 |
+| **6-8GB** | 2B turbo | `acestep-5Hz-lm-0.6B` | `pt` | 轻量 LM，PyTorch 后端 |
+| **8-16GB** | 2B turbo/sft | `0.6B` / `1.7B` | `vllm` | 8-12GB 用 0.6B，12-16GB 用 1.7B |
+| **16-20GB** | 2B sft 或 XL turbo | `acestep-5Hz-lm-1.7B` | `vllm` | XL 在 20GB 以下需要 CPU 卸载 |
+| **20-24GB** | XL turbo/sft | `acestep-5Hz-lm-1.7B` | `vllm` | XL 无需卸载；可用 4B LM |
+| **≥24GB** | XL sft（或 xl-base 用于 extract/lego/complete） | `acestep-5Hz-lm-4B` | `vllm` | 最佳质量，所有模型无需卸载 |
 
 > 📖 详细 GPU 兼容性信息（等级表、时长限制、批量大小、自适应 UI 默认设置、显存优化），请参阅 [GPU 兼容性指南](GPU_COMPATIBILITY.md)。
 

@@ -24,13 +24,16 @@ def _build_saved_params(
     text2music_audio_code_string, repainting_start, repainting_end,
     instruction_display_gen, audio_cover_strength, cover_noise_strength, task_type,
     use_adg, cfg_interval_start, cfg_interval_end, shift, infer_method,
-    audio_format, lm_temperature,
+    sampler_mode, velocity_norm_threshold, velocity_ema_factor,
+    audio_format, mp3_bitrate, mp3_sample_rate, lm_temperature,
     think_checkbox, lm_cfg_scale, lm_top_k, lm_top_p, lm_negative_prompt,
     use_cot_metas, use_cot_caption, use_cot_language,
     constrained_decoding_debug, allow_lm_batch, auto_score, auto_lrc,
     score_scale, lm_batch_chunk_size,
     track_name, complete_track_classes,
-    enable_normalization, normalization_db, latent_shift, latent_rescale,
+    enable_normalization, normalization_db, fade_in_duration, fade_out_duration,
+    latent_shift, latent_rescale,
+    repaint_mode="balanced", repaint_strength=0.5,
 ):
     """Build the parameter snapshot dict stored in batch history."""
     return {
@@ -50,7 +53,13 @@ def _build_saved_params(
         "cfg_interval_start": cfg_interval_start,
         "cfg_interval_end": cfg_interval_end,
         "shift": shift, "infer_method": infer_method,
-        "audio_format": audio_format, "lm_temperature": lm_temperature,
+        "sampler_mode": sampler_mode,
+        "velocity_norm_threshold": velocity_norm_threshold,
+        "velocity_ema_factor": velocity_ema_factor,
+        "audio_format": audio_format,
+        "mp3_bitrate": mp3_bitrate,
+        "mp3_sample_rate": mp3_sample_rate,
+        "lm_temperature": lm_temperature,
         "think_checkbox": think_checkbox, "lm_cfg_scale": lm_cfg_scale,
         "lm_top_k": lm_top_k, "lm_top_p": lm_top_p,
         "lm_negative_prompt": lm_negative_prompt,
@@ -63,7 +72,10 @@ def _build_saved_params(
         "track_name": track_name, "complete_track_classes": complete_track_classes,
         "enable_normalization": enable_normalization,
         "normalization_db": normalization_db,
+        "fade_in_duration": fade_in_duration,
+        "fade_out_duration": fade_out_duration,
         "latent_shift": latent_shift, "latent_rescale": latent_rescale,
+        "repaint_mode": repaint_mode, "repaint_strength": repaint_strength,
     }
 
 
@@ -99,8 +111,13 @@ def _apply_param_defaults(params):
         "audio_cover_strength": 1.0, "cover_noise_strength": 0.0,
         "task_type": "text2music", "use_adg": False,
         "cfg_interval_start": 0.0, "cfg_interval_end": 1.0,
-        "shift": 1.0, "infer_method": "ode", "custom_timesteps": "",
-        "audio_format": "flac", "lm_temperature": 0.85,
+        "shift": 1.0, "infer_method": "ode",
+        "sampler_mode": "euler", "velocity_norm_threshold": 0.0,
+        "velocity_ema_factor": 0.0, "custom_timesteps": "",
+        "audio_format": "flac",
+        "mp3_bitrate": "128k",
+        "mp3_sample_rate": 48000,
+        "lm_temperature": 0.85,
         "think_checkbox": True, "lm_cfg_scale": 2.0,
         "lm_top_k": 0, "lm_top_p": 0.9,
         "lm_negative_prompt": "NO USER INPUT",
@@ -112,7 +129,9 @@ def _apply_param_defaults(params):
         "lm_batch_chunk_size": 8,
         "track_name": None, "complete_track_classes": [],
         "enable_normalization": True, "normalization_db": -1.0,
+        "fade_in_duration": 0.0, "fade_out_duration": 0.0,
         "latent_shift": 0.0, "latent_rescale": 1.0,
+        "repaint_mode": "balanced", "repaint_strength": 0.5,
     }
     for key, value in defaults.items():
         params.setdefault(key, value)

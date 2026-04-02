@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import copy
 import math
 import time
 from typing import Callable, List, Optional, Union
@@ -1276,7 +1277,8 @@ class AceStepDiTModel(AceStepPreTrainedModel):
         self.time_embed_r = TimestepEmbedding(in_channels=256, time_embed_dim=inner_dim)
         
         # Project encoder hidden states to model dimension
-        self.condition_embedder = nn.Linear(inner_dim, inner_dim, bias=True)
+        condition_dim = getattr(config, "encoder_hidden_size", None) or config.hidden_size
+        self.condition_embedder = nn.Linear(condition_dim, inner_dim, bias=True)
 
         # Output normalization and projection
         # Adaptive layer norm with scale-shift modulation, then de-patchify
@@ -1551,6 +1553,38 @@ class AceStepConditionEncoder(AceStepPreTrainedModel):
         return encoder_hidden_states, encoder_attention_mask
 
 
+def _repaint_step_injection(xt, clean_src, mask, t_next, noise):
+    """Replace non-repaint regions of *xt* with noised source latents."""
+    zt = t_next * noise + (1.0 - t_next) * clean_src
+    m = mask.unsqueeze(-1).expand_as(xt)
+    return torch.where(m, xt, zt)
+
+
+def _repaint_boundary_blend(x_gen, clean_src, mask, cf_frames):
+    """Blend generated latents with source at repaint boundaries."""
+    soft = mask.float().clone()
+    if cf_frames <= 0:
+        m = soft.unsqueeze(-1).expand_as(x_gen)
+        return m * x_gen + (1.0 - m) * clean_src
+    B, T = mask.shape
+    for b in range(B):
+        row = mask[b]
+        if row.all() or not row.any():
+            continue
+        idx = torch.nonzero(row, as_tuple=False).squeeze(-1)
+        if idx.numel() == 0:
+            continue
+        left, right = idx[0].item(), idx[-1].item() + 1
+        fs = max(left - cf_frames, 0)
+        if left - fs > 0:
+            soft[b, fs:left] = torch.linspace(0, 1, left - fs + 2, device=soft.device)[1:-1]
+        fe = min(right + cf_frames, T)
+        if fe - right > 0:
+            soft[b, right:fe] = torch.linspace(1, 0, fe - right + 2, device=soft.device)[1:-1]
+    m = soft.unsqueeze(-1).expand_as(x_gen)
+    return m * x_gen + (1.0 - m) * clean_src
+
+
 class AceStepConditionGenerationModel(AceStepPreTrainedModel):
     """
     Main conditional generation model for AceStep.
@@ -1565,11 +1599,22 @@ class AceStepConditionGenerationModel(AceStepPreTrainedModel):
         self.config = config
         # Diffusion model components
         self.decoder = AceStepDiTModel(config)  # Main diffusion transformer
-        self.encoder = AceStepConditionEncoder(config)  # Condition encoder
-        self.tokenizer = AceStepAudioTokenizer(config)  # Audio tokenizer
-        self.detokenizer = AudioTokenDetokenizer(config)  # Audio detokenizer
+        # Build encoder config: use separate encoder_hidden_size when available
+        # (4B models have encoder_hidden_size=2048 != hidden_size=2560)
+        _enc_hs = getattr(config, "encoder_hidden_size", None) or config.hidden_size
+        if _enc_hs != config.hidden_size:
+            encoder_config = copy.deepcopy(config)
+            encoder_config.hidden_size = _enc_hs
+            encoder_config.intermediate_size = getattr(config, "encoder_intermediate_size", None) or config.intermediate_size
+            encoder_config.num_attention_heads = getattr(config, "encoder_num_attention_heads", None) or config.num_attention_heads
+            encoder_config.num_key_value_heads = getattr(config, "encoder_num_key_value_heads", None) or config.num_key_value_heads
+        else:
+            encoder_config = config
+        self.encoder = AceStepConditionEncoder(encoder_config)  # Condition encoder
+        self.tokenizer = AceStepAudioTokenizer(encoder_config)  # Audio tokenizer
+        self.detokenizer = AudioTokenDetokenizer(encoder_config)  # Audio detokenizer
         # Null condition embedding for classifier-free guidance
-        self.null_condition_emb = nn.Parameter(torch.randn(1, 1, config.hidden_size))
+        self.null_condition_emb = nn.Parameter(torch.randn(1, 1, encoder_config.hidden_size))
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1802,6 +1847,13 @@ class AceStepConditionGenerationModel(AceStepPreTrainedModel):
         shift: float = 3.0,
         timesteps: Optional[torch.Tensor] = None,
         cover_noise_strength: float = 0.0,
+        repaint_mask: Optional[torch.Tensor] = None,
+        clean_src_latents: Optional[torch.FloatTensor] = None,
+        repaint_crossfade_frames: int = 10,
+        repaint_injection_ratio: float = 0.5,
+        sampler_mode: str = "euler",
+        velocity_norm_threshold: float = 0.0,
+        velocity_ema_factor: float = 0.0,
         **kwargs,
     ):
         # Valid shifts: only discrete values 1, 2, 3 are supported
@@ -1942,6 +1994,14 @@ class AceStepConditionGenerationModel(AceStepPreTrainedModel):
         num_steps = len(t_schedule)
         
         # Recalculate cover_steps based on actual num_steps
+        use_heun = sampler_mode == "heun"
+        use_norm_clamp = velocity_norm_threshold > 0.0
+        use_ema = velocity_ema_factor > 0.0
+        prev_vt = None
+        if use_heun and infer_method == "sde":
+            logger.warning("Heun sampler is not compatible with SDE; falling back to Euler.")
+            use_heun = False
+
         cover_steps = int(num_steps * audio_cover_strength)
         _switched_to_non_cover = False
         for step_idx in range(num_steps):
@@ -1970,18 +2030,64 @@ class AceStepConditionGenerationModel(AceStepPreTrainedModel):
                 
             vt = decoder_outputs[0]
             past_key_values = decoder_outputs[1]
-            
+
+            # Velocity norm clamping — prevents outlier predictions
+            if use_norm_clamp:
+                vt_norm = torch.norm(vt, dim=(1, 2), keepdim=True)
+                xt_norm = torch.norm(xt, dim=(1, 2), keepdim=True) + 1e-10
+                scale = torch.clamp(velocity_norm_threshold * xt_norm / (vt_norm + 1e-10), max=1.0)
+                vt = vt * scale
+
+            # Velocity EMA smoothing — stabilises denoising trajectory
+            if use_ema and prev_vt is not None:
+                vt = (1.0 - velocity_ema_factor) * vt + velocity_ema_factor * prev_vt
+
             # On final step, directly compute x0 from noise
             if step_idx == num_steps - 1:
                 xt = self.get_x0_from_noise(xt, vt, t_curr_tensor)
+                prev_vt = vt
                 break
-            
+
             # Update x_t based on inference method
             if infer_method == "sde":
                 # Stochastic Differential Equation: predict clean, then re-add noise
                 pred_clean = self.get_x0_from_noise(xt, vt, t_curr_tensor)
                 next_timestep = t_schedule[step_idx + 1].item()
                 xt = self.renoise(pred_clean, next_timestep)
+                t_after_step = next_timestep
+            elif use_heun and infer_method == "ode":
+                # Heun (second-order) ODE step via trapezoidal rule
+                next_timestep = t_schedule[step_idx + 1].item()
+                dt = current_timestep - next_timestep
+                dt_tensor = dt * torch.ones((bsz,), device=device, dtype=dtype).unsqueeze(-1).unsqueeze(-1)
+                xt_predicted = xt - vt * dt_tensor
+                # Corrector: evaluate model at the predicted point
+                t_next_tensor = next_timestep * torch.ones((bsz,), device=device, dtype=dtype)
+                corrector_kv = EncoderDecoderCache(DynamicCache(), DynamicCache())
+                with torch.no_grad():
+                    decoder_outputs2 = self.decoder(
+                        hidden_states=xt_predicted,
+                        timestep=t_next_tensor,
+                        timestep_r=t_next_tensor,
+                        attention_mask=attention_mask,
+                        encoder_hidden_states=encoder_hidden_states,
+                        encoder_attention_mask=encoder_attention_mask,
+                        context_latents=context_latents,
+                        use_cache=False,
+                        past_key_values=corrector_kv,
+                    )
+                vt2 = decoder_outputs2[0]
+                if use_norm_clamp:
+                    vt2_norm = torch.norm(vt2, dim=(1, 2), keepdim=True)
+                    xt_pred_norm = torch.norm(xt_predicted, dim=(1, 2), keepdim=True) + 1e-10
+                    scale2 = torch.clamp(velocity_norm_threshold * xt_pred_norm / (vt2_norm + 1e-10), max=1.0)
+                    vt2 = vt2 * scale2
+                if use_ema:
+                    vt2 = (1.0 - velocity_ema_factor) * vt2 + velocity_ema_factor * vt
+                vt_avg = 0.5 * (vt + vt2)
+                xt = xt - vt_avg * dt_tensor
+                vt = vt_avg
+                t_after_step = next_timestep
             elif infer_method == "ode":
                 # Ordinary Differential Equation: Euler method
                 # dx/dt = -v, so x_{t+1} = x_t - v_t * dt
@@ -1989,8 +2095,21 @@ class AceStepConditionGenerationModel(AceStepPreTrainedModel):
                 dt = current_timestep - next_timestep
                 dt_tensor = dt * torch.ones((bsz,), device=device, dtype=dtype).unsqueeze(-1).unsqueeze(-1)
                 xt = xt - vt * dt_tensor
+                t_after_step = next_timestep
+
+            prev_vt = vt
+
+            injection_cutoff = round(repaint_injection_ratio * num_steps)
+            if repaint_mask is not None and clean_src_latents is not None and step_idx < injection_cutoff:
+                xt = _repaint_step_injection(
+                    xt, clean_src_latents, repaint_mask, t_after_step, noise,
+                )
         
         x_gen = xt
+        if repaint_mask is not None and clean_src_latents is not None and repaint_crossfade_frames > 0:
+            x_gen = _repaint_boundary_blend(
+                x_gen, clean_src_latents, repaint_mask, repaint_crossfade_frames,
+            )
         end_time = time.time()
         time_costs["diffusion_time_cost"] = end_time - start_time
         time_costs["diffusion_per_step_time_cost"] = time_costs["diffusion_time_cost"] / num_steps

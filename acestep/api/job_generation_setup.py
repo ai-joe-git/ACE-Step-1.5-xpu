@@ -7,6 +7,11 @@ from typing import Any, Callable, Optional
 
 from acestep.inference import GenerationConfig, GenerationParams
 
+# Sensible fallback when the API receives a null/missing audio_duration.
+# This prevents -1.0/None from propagating into the LLM and DiT, which
+# can cause unconstrained code generation and downstream tensor mismatches.
+_API_DEFAULT_DURATION_SECONDS: float = 120.0
+
 
 @dataclass
 class GenerationSetup:
@@ -34,7 +39,11 @@ def _resolve_instruction(
     """
 
     instruction_to_use = req.instruction
-    if instruction_to_use == default_dit_instruction and req.task_type in task_instructions:
+    should_resolve = (
+        not instruction_to_use or not instruction_to_use.strip()
+        or instruction_to_use == default_dit_instruction
+    ) and req.task_type in task_instructions
+    if should_resolve:
         raw_instruction = task_instructions[req.task_type]
 
         if req.task_type == "complete":
@@ -43,8 +52,14 @@ def _resolve_instruction(
                 instruction_to_use = raw_instruction.format(TRACK_CLASSES=classes_str)
             else:
                 instruction_to_use = task_instructions.get("complete_default", raw_instruction)
-        elif "{TRACK_NAME}" in raw_instruction and req.track_name:
-            instruction_to_use = raw_instruction.format(TRACK_NAME=req.track_name.upper())
+        elif "{TRACK_NAME}" in raw_instruction:
+            if req.track_name:
+                instruction_to_use = raw_instruction.format(TRACK_NAME=req.track_name.upper())
+            else:
+                # Fall back to default instruction when track_name is missing
+                # to avoid sending literal {TRACK_NAME} placeholder to the model
+                default_key = f"{req.task_type}_default"
+                instruction_to_use = task_instructions.get(default_key, raw_instruction)
         else:
             instruction_to_use = raw_instruction
 
@@ -84,6 +99,7 @@ def build_generation_setup(
     *,
     req: Any,
     caption: str,
+    global_caption: str = "",
     lyrics: str,
     bpm: Any,
     key_scale: Any,
@@ -141,13 +157,14 @@ def build_generation_setup(
         src_audio=req.src_audio_path,
         audio_codes=req.audio_code_string if req.audio_code_string else "",
         caption=caption,
+        global_caption=global_caption,
         lyrics=lyrics,
         instrumental=is_instrumental(lyrics),
         vocal_language=req.vocal_language,
         bpm=bpm,
         keyscale=key_scale,
         timesignature=time_signature,
-        duration=audio_duration if audio_duration else -1.0,
+        duration=audio_duration if (audio_duration and audio_duration > 0) else _API_DEFAULT_DURATION_SECONDS,
         inference_steps=req.inference_steps,
         seed=req.seed,
         guidance_scale=req.guidance_scale,
@@ -159,6 +176,15 @@ def build_generation_setup(
         timesteps=parsed_timesteps,
         repainting_start=req.repainting_start,
         repainting_end=req.repainting_end if req.repainting_end else -1,
+        chunk_mask_mode=getattr(req, "chunk_mask_mode", "auto"),
+        repaint_latent_crossfade_frames=getattr(
+            req, "repaint_latent_crossfade_frames", 10,
+        ),
+        repaint_wav_crossfade_sec=getattr(
+            req, "repaint_wav_crossfade_sec", 0.0,
+        ),
+        repaint_mode=getattr(req, "repaint_mode", "balanced"),
+        repaint_strength=getattr(req, "repaint_strength", 0.5),
         audio_cover_strength=req.audio_cover_strength,
         cover_noise_strength=req.cover_noise_strength,
         thinking=thinking,

@@ -130,7 +130,7 @@ def _add_model_args(parser: argparse.ArgumentParser) -> None:
         default="turbo",
         help=(
             "Model variant or subfolder name (default: turbo). "
-            "Official: turbo, base, sft. "
+            "Official: turbo, base, sft (2B) or xl_turbo, xl_base, xl_sft (XL/4B). "
             "For fine-tunes: use the exact folder name under checkpoint-dir."
         ),
     )
@@ -138,16 +138,16 @@ def _add_model_args(parser: argparse.ArgumentParser) -> None:
         "--base-model",
         type=str,
         default=None,
-        choices=["turbo", "base", "sft"],
+        choices=["turbo", "base", "sft", "xl_turbo", "xl_base", "xl_sft"],
         help=(
-            "Base model a fine-tune was trained from (turbo/base/sft). "
+            "Base model a fine-tune was trained from (turbo/base/sft, or xl_turbo/xl_base/xl_sft for XL). "
             "Used to condition timestep sampling. Auto-detected for official models."
         ),
     )
 
 
 def _add_device_args(parser: argparse.ArgumentParser) -> None:
-    """Add --device and --precision."""
+    """Add --device, --precision, --num-devices, and --strategy."""
     g = parser.add_argument_group("Device / platform")
     g.add_argument(
         "--device",
@@ -161,6 +161,19 @@ def _add_device_args(parser: argparse.ArgumentParser) -> None:
         default="auto",
         choices=["auto", "bf16", "fp16", "fp32"],
         help="Precision: auto, bf16, fp16, fp32 (default: auto)",
+    )
+    g.add_argument(
+        "--num-devices",
+        type=int,
+        default=1,
+        help="Number of GPUs for DDP training (default: 1)",
+    )
+    g.add_argument(
+        "--strategy",
+        type=str,
+        default="auto",
+        choices=["auto", "ddp"],
+        help="Distributed strategy: auto or ddp (default: auto)",
     )
 
 

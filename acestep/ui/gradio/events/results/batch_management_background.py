@@ -54,6 +54,10 @@ def generate_next_batch_background(
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        if (hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache")
+                and hasattr(torch.backends, "mps")
+                and torch.backends.mps.is_available()):
+            torch.mps.empty_cache()
 
         generator = generate_with_progress(
             dit_handler, llm_handler,
@@ -83,8 +87,13 @@ def generate_next_batch_background(
             cfg_interval_end=params.get("cfg_interval_end"),
             shift=params.get("shift"),
             infer_method=params.get("infer_method"),
+            sampler_mode=params.get("sampler_mode", "euler"),
+            velocity_norm_threshold=params.get("velocity_norm_threshold", 0.0),
+            velocity_ema_factor=params.get("velocity_ema_factor", 0.0),
             custom_timesteps=params.get("custom_timesteps"),
             audio_format=params.get("audio_format"),
+            mp3_bitrate=params.get("mp3_bitrate"),
+            mp3_sample_rate=params.get("mp3_sample_rate"),
             lm_temperature=params.get("lm_temperature"),
             think_checkbox=params.get("think_checkbox"),
             lm_cfg_scale=params.get("lm_cfg_scale"),
@@ -103,8 +112,12 @@ def generate_next_batch_background(
             lm_batch_chunk_size=params.get("lm_batch_chunk_size"),
             enable_normalization=params.get("enable_normalization"),
             normalization_db=params.get("normalization_db"),
+            fade_in_duration=params.get("fade_in_duration", 0.0),
+            fade_out_duration=params.get("fade_out_duration", 0.0),
             latent_shift=params.get("latent_shift", 0.0),
             latent_rescale=params.get("latent_rescale", 1.0),
+            repaint_mode=params.get("repaint_mode", "balanced"),
+            repaint_strength=params.get("repaint_strength", 0.5),
             progress=progress,
         )
 

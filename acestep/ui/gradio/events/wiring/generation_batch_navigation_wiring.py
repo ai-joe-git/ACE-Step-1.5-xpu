@@ -102,7 +102,8 @@ def _build_capture_current_params_inputs(generation_section: dict[str, Any]) -> 
             `use_cot_language`), automation controls
             (`auto_score`, `auto_lrc`, `score_scale`), and normalization/latent
             controls (`enable_normalization`, `normalization_db`,
-            `latent_shift`, `latent_rescale`).
+            `latent_shift`, `latent_rescale`), and repaint controls
+            (`repaint_mode`, `repaint_strength`).
 
     Returns:
         list[Any]: Ordered generation control values used to preserve and
@@ -138,6 +139,8 @@ def _build_capture_current_params_inputs(generation_section: dict[str, Any]) -> 
         generation_section["infer_method"],
         generation_section["custom_timesteps"],
         generation_section["audio_format"],
+        generation_section["mp3_bitrate"],
+        generation_section["mp3_sample_rate"],
         generation_section["lm_temperature"],
         generation_section["think_checkbox"],
         generation_section["lm_cfg_scale"],
@@ -157,8 +160,12 @@ def _build_capture_current_params_inputs(generation_section: dict[str, Any]) -> 
         generation_section["complete_track_classes"],
         generation_section["enable_normalization"],
         generation_section["normalization_db"],
+        generation_section["fade_in_duration"],
+        generation_section["fade_out_duration"],
         generation_section["latent_shift"],
         generation_section["latent_rescale"],
+        generation_section["repaint_mode"],
+        generation_section["repaint_strength"],
     ]
 
 

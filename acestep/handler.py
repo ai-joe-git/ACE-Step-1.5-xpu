@@ -125,8 +125,11 @@ class AceStepHandler(
         # Batch size
         self.batch_size = 2
         
-        # Custom layers config
-        self.custom_layers_config = {2: [6], 3: [10, 11], 4: [3], 5: [8, 9], 6: [8]}
+        # Lyric alignment attention layers config.  Defaults to the 2B DiT
+        # mapping; overridden by the model's lyric_alignment_layers_config
+        # in AceStepConfig when present (see _sync_alignment_config).
+        from acestep.core.generation.handler.lyric_alignment_common import _DEFAULT_LAYERS_CONFIG
+        self.custom_layers_config = dict(_DEFAULT_LAYERS_CONFIG)
         self.offload_to_cpu = False
         self.offload_dit_to_cpu = False
         self.compiled = False

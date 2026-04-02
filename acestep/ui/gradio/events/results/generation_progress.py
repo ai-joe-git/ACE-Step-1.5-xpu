@@ -41,7 +41,8 @@ def generate_with_progress(
     text2music_audio_code_string, repainting_start, repainting_end,
     instruction_display_gen, audio_cover_strength, cover_noise_strength, task_type,
     use_adg, cfg_interval_start, cfg_interval_end, shift, infer_method,
-    custom_timesteps, audio_format, lm_temperature,
+    sampler_mode, velocity_norm_threshold, velocity_ema_factor,
+    custom_timesteps, audio_format, mp3_bitrate, mp3_sample_rate, lm_temperature,
     think_checkbox, lm_cfg_scale, lm_top_k, lm_top_p, lm_negative_prompt,
     use_cot_metas, use_cot_caption, use_cot_language, is_format_caption,
     constrained_decoding_debug,
@@ -52,8 +53,12 @@ def generate_with_progress(
     lm_batch_chunk_size,
     enable_normalization,
     normalization_db,
+    fade_in_duration,
+    fade_out_duration,
     latent_shift,
     latent_rescale,
+    repaint_mode,
+    repaint_strength,
     progress=gr.Progress(track_tqdm=True),
 ):
     """Generate audio with progress tracking.
@@ -67,6 +72,11 @@ def generate_with_progress(
     # GPU memory validation
     gpu_config = get_global_gpu_config()
     lm_initialized = llm_handler.llm_initialized if llm_handler else False
+
+    # Save-memory mode: force-disable features that require intermediate tensors
+    if gpu_config.save_memory_mode:
+        auto_score = False
+        auto_lrc = False
 
     if audio_duration is not None and audio_duration > 0:
         is_valid, warning_msg = check_duration_limit(audio_duration, gpu_config, lm_initialized)
@@ -124,6 +134,9 @@ def generate_with_progress(
         cfg_interval_end=cfg_interval_end,
         shift=shift,
         infer_method=infer_method,
+        sampler_mode=sampler_mode,
+        velocity_norm_threshold=velocity_norm_threshold,
+        velocity_ema_factor=velocity_ema_factor,
         timesteps=parsed_timesteps,
         repainting_start=repainting_start,
         repainting_end=repainting_end,
@@ -141,8 +154,12 @@ def generate_with_progress(
         use_constrained_decoding=True,
         enable_normalization=enable_normalization,
         normalization_db=normalization_db,
+        fade_in_duration=fade_in_duration if fade_in_duration else 0.0,
+        fade_out_duration=fade_out_duration if fade_out_duration else 0.0,
         latent_shift=latent_shift,
         latent_rescale=latent_rescale,
+        repaint_mode=repaint_mode if repaint_mode else "balanced",
+        repaint_strength=float(repaint_strength) if repaint_strength is not None else 0.5,
     )
 
     if isinstance(seed, str) and seed.strip():
@@ -158,6 +175,8 @@ def generate_with_progress(
         lm_batch_chunk_size=lm_batch_chunk_size,
         constrained_decoding_debug=constrained_decoding_debug,
         audio_format=audio_format,
+        mp3_bitrate=mp3_bitrate,
+        mp3_sample_rate=mp3_sample_rate,
     )
 
     result = generate_music(dit_handler, llm_handler, params=gen_params, config=gen_config, progress=progress)
@@ -201,7 +220,7 @@ def generate_with_progress(
         return
 
     audios = result.audios
-    progress(0.99, "Converting audio to mp3...")
+    progress(0.99, "Preparing audio files...")
 
     # Clear all scores/codes/lrc displays
     clear_scores = [gr.update(value="", visible=True) for _ in range(8)]
@@ -240,6 +259,7 @@ def generate_with_progress(
         saved_path = save_audio(
             audio_data=audio_tensor, output_path=audio_path,
             sample_rate=sample_rate, format=audio_format, channels_first=True,
+            mp3_bitrate=mp3_bitrate, mp3_sample_rate=mp3_sample_rate,
         )
         if saved_path:
             audio_path = saved_path.replace("\\", "/")

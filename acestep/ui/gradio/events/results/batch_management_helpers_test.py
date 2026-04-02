@@ -62,6 +62,8 @@ class BatchManagementHelperTests(unittest.TestCase):
             1.0,
             "ode",
             "flac",
+            "128k",
+            48000,
             0.85,
             True,
             2.0,
@@ -82,12 +84,18 @@ class BatchManagementHelperTests(unittest.TestCase):
             True,
             -1.0,
             0.0,
+            0.0,
+            0.0,
             1.0,
         )
         self.assertEqual(params["captions"], "cap")
         self.assertEqual(params["lyrics"], "lyr")
         self.assertEqual(params["track_name"], "track")
+        self.assertEqual(params["mp3_bitrate"], "128k")
+        self.assertEqual(params["mp3_sample_rate"], 48000)
         self.assertIn("latent_rescale", params)
+        self.assertIn("fade_in_duration", params)
+        self.assertIn("fade_out_duration", params)
 
     def test_apply_param_defaults_adds_missing_without_overwrite(self):
         """Defaults helper should add absent keys and preserve existing values."""
@@ -97,7 +105,13 @@ class BatchManagementHelperTests(unittest.TestCase):
         self.assertEqual(params["captions"], "keep")
         self.assertEqual(params["lm_top_k"], 7)
         self.assertEqual(params["audio_format"], "flac")
+        self.assertEqual(params["mp3_bitrate"], "128k")
+        self.assertEqual(params["mp3_sample_rate"], 48000)
         self.assertIn("latent_shift", params)
+        self.assertIn("fade_in_duration", params)
+        self.assertIn("fade_out_duration", params)
+        self.assertEqual(params["fade_in_duration"], 0.0)
+        self.assertEqual(params["fade_out_duration"], 0.0)
 
     def test_extract_scores_handles_wrapped_values_and_missing_indices(self):
         """Score extraction should normalize mixed score payload shapes."""

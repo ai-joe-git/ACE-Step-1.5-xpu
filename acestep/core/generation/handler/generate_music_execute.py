@@ -33,6 +33,11 @@ class GenerateMusicExecuteMixin:
         cfg_interval_end: float,
         shift: float,
         infer_method: str,
+        sampler_mode: str = "euler",
+        velocity_norm_threshold: float = 0.0,
+        velocity_ema_factor: float = 0.0,
+        repaint_crossfade_frames: int = 10,
+        repaint_injection_ratio: float = 0.5,
     ) -> Dict[str, Any]:
         """Invoke ``service_generate`` while maintaining background progress estimation.
 
@@ -58,6 +63,7 @@ class GenerateMusicExecuteMixin:
             try:
                 _result["outputs"] = self.service_generate(
                     captions=service_inputs["captions_batch"],
+                    global_captions=service_inputs.get("global_captions_batch"),
                     lyrics=service_inputs["lyrics_batch"],
                     metas=service_inputs["metas_batch"],
                     vocal_languages=service_inputs["vocal_languages_batch"],
@@ -76,9 +82,15 @@ class GenerateMusicExecuteMixin:
                     cfg_interval_end=cfg_interval_end,
                     shift=shift,
                     infer_method=infer_method,
+                    sampler_mode=sampler_mode,
+                    velocity_norm_threshold=velocity_norm_threshold,
+                    velocity_ema_factor=velocity_ema_factor,
                     audio_code_hints=service_inputs["audio_code_hints_batch"],
                     return_intermediate=service_inputs["should_return_intermediate"],
                     timesteps=timesteps,
+                    chunk_mask_modes=service_inputs.get("chunk_mask_modes_batch"),
+                    repaint_crossfade_frames=repaint_crossfade_frames,
+                    repaint_injection_ratio=repaint_injection_ratio,
                 )
             except Exception as exc:
                 _error["exc"] = exc

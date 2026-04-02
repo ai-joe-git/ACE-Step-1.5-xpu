@@ -13,8 +13,37 @@ from acestep.ui.gradio.i18n import t
 from acestep.gpu_config import (
     get_global_gpu_config, is_lm_model_size_allowed, find_best_lm_model_on_disk,
     get_gpu_config_for_tier, set_global_gpu_config, GPU_TIER_LABELS, GPU_TIER_CONFIGS,
+    resolve_lm_backend,
 )
-from .model_config import is_pure_base_model, get_model_type_ui_settings
+from .model_config import is_pure_base_model, is_sft_model, is_xl_model, get_model_type_ui_settings
+
+
+def _select_quantization_value(
+    *,
+    quantization_enabled: bool,
+    device: str,
+) -> str | None:
+    """Return the DiT quantization mode selected for the current UI state."""
+    quant_value = "int8_weight_only" if quantization_enabled else None
+    if not quantization_enabled or device not in {"auto", "cuda"}:
+        return quant_value
+
+    try:
+        import torch
+    except ImportError:
+        return quant_value
+
+    try:
+        if torch.cuda.is_available():
+            major, _ = torch.cuda.get_device_capability(0)
+            if major < 7:
+                logger.info(
+                    "Pre-Ampere CUDA detected: using w8a8_dynamic quantization for stability"
+                )
+                return "w8a8_dynamic"
+    except Exception:
+        return quant_value
+    return quant_value
 
 
 def refresh_checkpoints(dit_handler):
@@ -38,7 +67,10 @@ def init_service_wrapper(
         current_batch_size: Current batch size value from UI to preserve
             after reinitialization (optional).
     """
-    quant_value = "int8_weight_only" if quantization else None
+    quant_value = _select_quantization_value(
+        quantization_enabled=quantization,
+        device=device,
+    )
 
     gpu_config = get_global_gpu_config()
 
@@ -74,11 +106,12 @@ def init_service_wrapper(
                 f"this may cause high VRAM usage or OOM."
             )
 
-    if init_llm and gpu_config.lm_backend_restriction == "pt_mlx_only" and backend == "vllm":
-        backend = gpu_config.recommended_backend
+    resolved_backend = resolve_lm_backend(backend, gpu_config)
+    if init_llm and resolved_backend != backend:
+        backend = resolved_backend
         logger.warning(
-            f"⚠️ vllm backend not supported for tier {gpu_config.tier} "
-            f"(VRAM too low for KV cache), falling back to {backend}"
+            f"⚠️ Requested LM backend is not supported for tier {gpu_config.tier} "
+            f"on this hardware, falling back to {backend}"
         )
 
     # Derive project_root from the checkpoint path (which is the checkpoints
@@ -118,12 +151,25 @@ def init_service_wrapper(
     accordion_state = gr.Accordion(open=not is_model_initialized)
 
     is_turbo = dit_handler.is_turbo_model()
-    is_pure_base = is_pure_base_model((config_path or "").lower())
+    config_path_lower = (config_path or "").lower()
+    is_pure_base = is_pure_base_model(config_path_lower)
+    # Match interactive path — SFT models need 50-step default here too.
+    is_sft = is_sft_model(config_path_lower)
     model_type_settings = get_model_type_ui_settings(
         is_turbo, current_mode=current_mode, is_pure_base=is_pure_base,
+        is_sft=is_sft,
     )
 
     gpu_config = get_global_gpu_config()
+
+    # Warn if XL (4B) model selected on a GPU with limited VRAM
+    if is_xl_model(config_path_lower) and gpu_config is not None:
+        gpu_mem = getattr(gpu_config, "gpu_memory_gb", 0)
+        if 0 < gpu_mem < 16:
+            gr.Warning(
+                f"XL (4B) model requires ≥16GB VRAM (detected {gpu_mem:.0f}GB). "
+                "Consider using a 2B model, or enable CPU offload."
+            )
     lm_actually_initialized = llm_handler.llm_initialized if llm_handler else False
     max_duration = gpu_config.max_duration_with_lm if lm_actually_initialized else gpu_config.max_duration_without_lm
     max_batch = gpu_config.max_batch_size_with_lm if lm_actually_initialized else gpu_config.max_batch_size_without_lm
@@ -197,7 +243,9 @@ def on_tier_change(selected_tier, llm_handler=None):
     set_global_gpu_config(new_config)
     logger.info(f"🔄 Tier manually changed to {selected_tier} — updating UI defaults")
 
-    if new_config.lm_backend_restriction == "pt_mlx_only":
+    if new_config.lm_backend_restriction == "pt_only":
+        available_backends = ["pt"]
+    elif new_config.lm_backend_restriction == "pt_mlx_only":
         available_backends = ["pt", "mlx"]
     else:
         available_backends = ["vllm", "pt", "mlx"]

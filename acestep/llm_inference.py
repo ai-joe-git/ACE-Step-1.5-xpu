@@ -2,6 +2,7 @@
 5Hz LM (Language Model) Handler
 Handles all LM-related operations including initialization and generation
 """
+import gc
 import os
 import sys
 import traceback
@@ -21,6 +22,7 @@ from transformers.generation.logits_process import (
     LogitsProcessorList,
     RepetitionPenaltyLogitsProcessor,
 )
+from acestep.llm_backend_compat import get_vllm_preflight_warning
 from acestep.constrained_logits_processor import MetadataConstrainedLogitsProcessor
 from acestep.constants import DEFAULT_LM_INSTRUCTION, DEFAULT_LM_UNDERSTAND_INSTRUCTION, DEFAULT_LM_INSPIRED_INSTRUCTION, DEFAULT_LM_REWRITE_INSTRUCTION, DURATION_MIN, DURATION_MAX
 from acestep.gpu_config import get_lm_gpu_memory_ratio, get_gpu_memory_gb, get_lm_model_size, get_global_gpu_config
@@ -78,6 +80,40 @@ class LLMHandler:
         self._mlx_model = None
         self._mlx_model_path = None
 
+    def _clear_accelerator_cache(self) -> None:
+        """Release freed accelerator memory back to the driver.
+
+        Synchronises the device *before* releasing cached blocks so that
+        every in-flight async write has landed and the freed blocks are
+        actually reclaimable.  Supports CUDA, XPU (Intel), and MPS
+        (Apple Silicon) backends.
+        """
+        try:
+            active_device = str(getattr(self, "device", "cpu")).split(":")[0]
+        except (TypeError, AttributeError):
+            active_device = None
+
+        # Fallback: if device is unset/None, detect by availability
+        if not active_device or active_device in ("cpu", "None"):
+            if torch.cuda.is_available():
+                active_device = "cuda"
+            elif hasattr(torch, "xpu") and torch.xpu.is_available():
+                active_device = "xpu"
+            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                active_device = "mps"
+
+        if active_device == "cuda" and torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+        elif active_device == "xpu" and hasattr(torch, "xpu") and torch.xpu.is_available():
+            torch.xpu.synchronize()
+            torch.xpu.empty_cache()
+        elif active_device == "mps" and hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            if hasattr(torch.mps, "synchronize"):
+                torch.mps.synchronize()
+            if hasattr(torch.mps, "empty_cache"):
+                torch.mps.empty_cache()
+
     def unload(self) -> None:
         """Release LM weights/tokenizer and clear caches to free memory."""
         try:
@@ -95,11 +131,7 @@ class LLMHandler:
             self.llm_backend = None
             self._mlx_model = None
             self._mlx_model_path = None
-            try:
-                import gc
-                gc.collect()
-            except Exception:
-                pass
+            gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()
@@ -245,10 +277,17 @@ class LLMHandler:
                 # CoT phase or mixed: add larger buffer for metadata overhead.
                 max_new_tokens = target_codes + 500
         else:
+            # When no target_duration is set, cap the fallback to a safe
+            # upper bound derived from DURATION_MAX so that generation cannot
+            # produce more audio codes than the downstream DiT can handle.
+            duration_cap = DURATION_MAX * 5 + 500  # codes + metadata buffer
             if fallback_max is not None:
-                max_new_tokens = fallback_max
+                max_new_tokens = min(fallback_max, duration_cap)
             else:
-                max_new_tokens = getattr(self, "max_model_len", 4096) - 64
+                max_new_tokens = min(
+                    getattr(self, "max_model_len", 4096) - 64,
+                    duration_cap,
+                )
 
         # Cap at model's max length
         if hasattr(self, "max_model_len"):
@@ -542,6 +581,7 @@ class LLMHandler:
 
             # Proactive CUDA cleanup before LM load to reduce fragmentation on mode/model switch
             if device == "cuda" and torch.cuda.is_available():
+                gc.collect()
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()
 
@@ -570,8 +610,14 @@ class LLMHandler:
             )
             logger.info(f"Constrained processor initialized in {time.time() - processor_start:.2f} seconds")
 
-            # Disable CUDA/HIP graph capture on ROCm (unverified on RDNA3 Windows)
-            # and on Jetson (SDPA paged-cache decode calls .item() during capture).
+            # Disable CUDA/HIP graph capture on ROCm (unverified on RDNA3 Windows),
+            # on Jetson (SDPA paged-cache decode calls .item() during capture),
+            # and when flash_attn is not installed (same .item() incompatibility on all CUDA hardware).
+            # When flash_attn is unavailable, nano-vllm falls back to _sdpa_decode_with_paged_cache
+            # which contains a Python loop with .item() calls.  These force CPU-GPU
+            # synchronisation that is forbidden inside torch.cuda.CUDAGraph capture,
+            # corrupting the CUDA context and causing downstream errors such as:
+            #   RuntimeError: Offset increment outside graph capture encountered unexpectedly
             is_rocm = hasattr(torch.version, 'hip') and torch.version.hip is not None
             is_jetson = False
             if device == "cuda" and torch.cuda.is_available():
@@ -582,7 +628,30 @@ class LLMHandler:
                         logger.info(f"Jetson GPU detected ({dev_name}): disabling CUDA graph capture for nano-vllm")
                 except Exception:
                     pass
-            enforce_eager_for_vllm = bool(is_rocm or is_jetson)
+            _has_flash_attn = False
+            try:
+                import importlib.util
+                _has_flash_attn = importlib.util.find_spec("flash_attn") is not None
+            except Exception:
+                pass
+            if not _has_flash_attn:
+                logger.info(
+                    "flash_attn not installed: disabling CUDA graph capture for nano-vllm "
+                    "(SDPA fallback uses .item() calls in paged-cache decode that are "
+                    "incompatible with CUDA graph capture)"
+                )
+            _has_triton = False
+            try:
+                import triton  # noqa: F401
+                _has_triton = True
+            except ImportError:
+                pass
+            if not _has_triton:
+                logger.info(
+                    "Triton not available: disabling CUDA graph capture for nano-vllm "
+                    "(CUDA graphs require torch.compile which depends on Triton)"
+                )
+            enforce_eager_for_vllm = bool(is_rocm or is_jetson or not _has_flash_attn or not _has_triton)
 
             # Auto-detect best backend on Apple Silicon
             if backend == "mlx" or (backend == "vllm" and device == "mps"):
@@ -618,6 +687,15 @@ class LLMHandler:
                 )
                 backend = "pt"
 
+            vllm_preflight_warning = None
+            if backend == "vllm":
+                vllm_preflight_warning = get_vllm_preflight_warning(device=device)
+                if vllm_preflight_warning is not None:
+                    logger.warning(f"[initialize] {vllm_preflight_warning}")
+                    backend = "pt"
+
+            vllm_fallback_note = None
+
             # Initialize based on user-selected backend
             if backend == "vllm":
                 _warn_if_prerelease_python()
@@ -645,9 +723,12 @@ class LLMHandler:
                     status_msg = self._initialize_5hz_lm_vllm(
                         full_lm_model_path,
                         enforce_eager=enforce_eager_for_vllm,
+                        has_triton=_has_triton,
                     )
                     logger.info(f"5Hz LM status message: {status_msg}")
                     if status_msg.startswith("❌"):
+                        logger.warning(f"vLLM initialization failed before PyTorch fallback: {status_msg}")
+                        vllm_fallback_note = status_msg.splitlines()[0]
                         if not self.llm_initialized:
                             if device == "mps" and self._is_mlx_available():
                                 logger.warning("vllm failed on MPS, trying MLX backend...")
@@ -660,19 +741,33 @@ class LLMHandler:
                             if not success:
                                 return status_msg, False
                             status_msg = f"✅ 5Hz LM initialized successfully (PyTorch fallback)\nModel: {full_lm_model_path}\nBackend: PyTorch"
+                            if vllm_fallback_note is not None:
+                                status_msg += f"\nNote: {vllm_fallback_note}"
             elif backend != "mlx":
                 success, status_msg = self._load_pytorch_model(full_lm_model_path, device)
                 if not success:
                     return status_msg, False
+                if vllm_preflight_warning is not None:
+                    status_msg += f"\nNote: {vllm_preflight_warning}"
 
             return status_msg, True
 
         except Exception as e:
             return f"❌ Error initializing 5Hz LM: {str(e)}\n\nTraceback:\n{traceback.format_exc()}", False
 
-    def _initialize_5hz_lm_vllm(self, model_path: str, enforce_eager: bool = False) -> str:
-        """Initialize 5Hz LM model using vllm backend. When enforce_eager is True, CUDA graph
-        capture is disabled (required when LoRA training may run in the same process)."""
+    def _initialize_5hz_lm_vllm(self, model_path: str, enforce_eager: bool = False, has_triton: bool = True) -> str:
+        """Initialize 5Hz LM model using vllm backend.
+
+        Args:
+            model_path: Path to the 5Hz LM model checkpoint.
+            enforce_eager: Disable CUDA graph capture.  Set to ``True`` when
+                Triton is unavailable so vLLM does not attempt graph capture
+                that depends on compiled kernels.
+            has_triton: Whether the Triton compiler is available.  When
+                ``False``, ``torch._dynamo`` diagnostics are temporarily
+                suppressed during initialization to avoid verbose fallback
+                warnings, then restored afterwards.
+        """
         if not torch.cuda.is_available():
             self.llm_initialized = False
             logger.error("CUDA/ROCm is not available. Please check your GPU setup.")
@@ -681,13 +776,14 @@ class LLMHandler:
             from nanovllm import LLM, SamplingParams
         except ImportError:
             self.llm_initialized = False
-            logger.error("nano-vllm is not installed. Please install it using 'cd acestep/third_parts/nano-vllm && pip install .")
-            return "❌ nano-vllm is not installed. Please install it using 'cd acestep/third_parts/nano-vllm && pip install ."
+            logger.error("nano-vllm is not installed. Please install it using 'cd acestep/third_parts/nano-vllm && pip install .'")
+            return "❌ nano-vllm is not installed. Please install it using 'cd acestep/third_parts/nano-vllm && pip install .'"
 
         try:
             current_device = torch.cuda.current_device()
             device_name = torch.cuda.get_device_name(current_device)
 
+            gc.collect()
             torch.cuda.empty_cache()
             self._cleanup_torch_distributed_state()
 
@@ -705,21 +801,53 @@ class LLMHandler:
                 self.max_model_len = 4096
 
             logger.info(f"Initializing 5Hz LM with model: {model_path}, enforce_eager: {enforce_eager}, tensor_parallel_size: 1, max_model_len: {self.max_model_len}, gpu_memory_utilization: {gpu_memory_utilization:.3f}")
-            start_time = time.time()
-            self.llm = LLM(
-                model=model_path,
-                enforce_eager=enforce_eager,
-                tensor_parallel_size=1,
-                max_model_len=self.max_model_len,
-                gpu_memory_utilization=gpu_memory_utilization,
-                tokenizer=self.llm_tokenizer,
-            )
-            logger.info(f"5Hz LM initialized successfully in {time.time() - start_time:.2f} seconds")
-            self.llm_initialized = True
-            self.llm_backend = "vllm"
-            return f"✅ 5Hz LM initialized successfully\nModel: {model_path}\nDevice: {device_name}\nGPU Memory Utilization: {gpu_memory_utilization:.3f}\nLow GPU Memory Mode: {low_gpu_memory_mode}"
+
+            # When Triton is unavailable, torch._dynamo still attempts to
+            # compile functions decorated with @torch.compile and emits
+            # verbose "WON'T CONVERT" warnings with full tracebacks.
+            # suppress_errors makes it fall back silently to eager mode,
+            # and raising the log level hides the noisy warning output.
+            # State is restored after init to avoid masking diagnostics
+            # from other components.
+            _dynamo_state_saved = False
+            if not has_triton:
+                import torch._dynamo as _dynamo
+                import logging as _logging
+                _dynamo_logger = _logging.getLogger("torch._dynamo")
+                _prev_suppress = _dynamo.config.suppress_errors
+                _prev_log_level = _dynamo_logger.level
+                _dynamo.config.suppress_errors = True
+                _dynamo_logger.setLevel(_logging.ERROR)
+                _dynamo_state_saved = True
+
+            try:
+                start_time = time.time()
+                self.llm = LLM(
+                    model=model_path,
+                    enforce_eager=enforce_eager,
+                    tensor_parallel_size=1,
+                    max_model_len=self.max_model_len,
+                    gpu_memory_utilization=gpu_memory_utilization,
+                    tokenizer=self.llm_tokenizer,
+                )
+                logger.info(f"5Hz LM initialized successfully in {time.time() - start_time:.2f} seconds")
+                self.llm_initialized = True
+                self.llm_backend = "vllm"
+                return f"✅ 5Hz LM initialized successfully\nModel: {model_path}\nDevice: {device_name}\nGPU Memory Utilization: {gpu_memory_utilization:.3f}\nLow GPU Memory Mode: {low_gpu_memory_mode}"
+            finally:
+                if _dynamo_state_saved:
+                    _dynamo.config.suppress_errors = _prev_suppress
+                    _dynamo_logger.setLevel(_prev_log_level)
         except Exception as e:
             self.llm_initialized = False
+            if "Cannot find a working triton installation" in str(e):
+                status_msg = "❌ vLLM backend requires a working Triton installation."
+                if sys.platform == "win32":
+                    status_msg += (
+                        " Falling back to PyTorch is recommended on Windows. "
+                        "Use --backend pt to avoid this warning."
+                    )
+                return status_msg
             return f"❌ Error initializing 5Hz LM: {str(e)}\n\nTraceback:\n{traceback.format_exc()}"
 
     def _run_vllm(
@@ -1231,7 +1359,10 @@ class LLMHandler:
                 formatted_prompt=formatted_prompt,
                 cfg={
                     "temperature": temperature,
-                    "cfg_scale": cfg_scale,
+                    # CFG must not be applied during CoT (text generation) phase.
+                    # cfg_scale > 1 distorts text logits during reasoning, causing
+                    # premature newlines and truncated captions.
+                    "cfg_scale": 1.0,
                     "negative_prompt": negative_prompt,
                     "top_k": top_k,
                     "top_p": top_p,
@@ -1275,6 +1406,23 @@ class LLMHandler:
             else:
                 logger.info("Phase 1: Using user-provided metadata (skipping generation)")
             metadata = {k: v for k, v in user_metadata.items() if v is not None}
+
+        # When the caller did not supply an explicit target_duration, use the
+        # duration that Phase 1 (CoT) produced so that Phase 2 code generation
+        # is properly constrained.  Without this, a null API duration lets
+        # Phase 2 run unconstrained, potentially producing more audio codes
+        # than the downstream DiT expects and causing a tensor-size mismatch.
+        if (target_duration is None or target_duration <= 0) and metadata.get("duration"):
+            try:
+                cot_duration = float(metadata["duration"])
+                if cot_duration > 0:
+                    target_duration = cot_duration
+                    logger.info(
+                        f"Using CoT-generated duration ({cot_duration}s) as "
+                        f"Phase 2 target_duration (original was None/unset)"
+                    )
+            except (ValueError, TypeError):
+                pass
 
         # If infer_type is 'dit', stop here and return only metadata
         if infer_type == "dit":
@@ -1397,6 +1545,8 @@ class LLMHandler:
                         }
                     },
                 }
+            finally:
+                self._clear_accelerator_cache()
 
             # Parse audio codes from each output
             audio_codes_list = []
@@ -2245,6 +2395,7 @@ class LLMHandler:
                     lyrics=lyrics,
                     cot_text=cot_text,
                 )
+                self._clear_accelerator_cache()
                 return output_text, f"✅ Generated successfully (vllm) | length={len(output_text)}"
 
             elif self.llm_backend == "mlx":
@@ -2270,6 +2421,7 @@ class LLMHandler:
                     lyrics=lyrics,
                     cot_text=cot_text,
                 )
+                self._clear_accelerator_cache()
                 return output_text, f"✅ Generated successfully (mlx) | length={len(output_text)}"
 
             # PyTorch backend (fallback)
@@ -2294,6 +2446,7 @@ class LLMHandler:
                 lyrics=lyrics,
                 cot_text=cot_text,
             )
+            self._clear_accelerator_cache()
             return output_text, f"✅ Generated successfully (pt) | length={len(output_text)}"
 
         except Exception as e:
@@ -2317,15 +2470,8 @@ class LLMHandler:
                 except Exception:
                     pass  # Ignore errors during cleanup
             # Clear accelerator cache to release any corrupted memory
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
-            elif hasattr(torch, 'xpu') and torch.xpu.is_available():
-                torch.xpu.empty_cache()
-                torch.xpu.synchronize()
-            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-                torch.mps.empty_cache()
-                torch.mps.synchronize()
+            gc.collect()
+            self._clear_accelerator_cache()
             return "", f"❌ Error generating from formatted prompt: {type(e).__name__}: {e or error_detail.splitlines()[-1]}"
 
     def _generate_with_constrained_decoding(
@@ -2419,6 +2565,9 @@ class LLMHandler:
         if streamer is not None:
             streamer.end()
 
+        # Explicitly free KV cache to reduce memory fragmentation
+        del past_key_values
+
         return generated_ids
 
     def _generate_with_cfg_custom(
@@ -2438,13 +2587,16 @@ class LLMHandler:
         """
         Custom CFG generation loop that:
         1. Processes both conditional and unconditional sequences in parallel
-        2. Applies CFG formula to logits
+        2. Applies CFG formula to logits, restricted to valid tokens when in CODES_GENERATION
         3. Samples tokens only for conditional sequences
         4. Applies the same sampled tokens to both conditional and unconditional sequences
         5. Optionally applies constrained decoding via FSM-based logits processor
+        6. Tracks per-sequence EOS state; stops only when all sequences have finished
 
-        Batch format: [cond_input, uncond_input]
+        Batch format: [cond_0..cond_n, uncond_0..uncond_n]
         """
+        from acestep.constrained_logits_processor import FSMState
+
         model = self.llm
         device = self.device
         batch_size = batch_input_ids.shape[0] // 2  # Half are conditional, half are unconditional
@@ -2475,6 +2627,9 @@ class LLMHandler:
         # Build logits processor for non-CFG operations (repetition penalty, top_k, top_p)
         logits_processor = self._build_logits_processor(repetition_penalty)
 
+        # Per-sequence finished tracking (Fix 4: batch compaction - stop when ALL done)
+        seq_finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+
         with torch.inference_mode():
             for step in tqdm(range(max_new_tokens), desc="LLM CFG Generation", unit="token", disable=self.disable_tqdm):
                 # Forward pass for the entire batch (conditional + unconditional)
@@ -2487,11 +2642,47 @@ class LLMHandler:
                 cond_logits = next_token_logits[cond_start_idx:cond_start_idx+batch_size]
                 uncond_logits = next_token_logits[uncond_start_idx:uncond_start_idx+batch_size]
 
-                # Apply CFG formula: cfg_logits = uncond_logits + cfg_scale * (cond_logits - uncond_logits)
-                # Upcast to float32 to prevent overflow in float16 (CFG scaling can exceed fp16 range)
-                cfg_logits = uncond_logits.float() + cfg_scale * (cond_logits.float() - uncond_logits.float())
+                # Fixes 2, 3, 5: When in CODES_GENERATION state, apply the non-audio mask
+                # BEFORE CFG to avoid:
+                #  - wasted compute over the full 217k vocab (only ~64k audio tokens are valid)
+                #  - probability mass leakage from text tokens into the softmax denominator
+                # Extract valid token indices and compute CFG only on those to avoid
+                # NaN from (-inf - -inf) when both cond and uncond are masked.
+                if (
+                    constrained_processor is not None
+                    and constrained_processor.state == FSMState.CODES_GENERATION
+                    and constrained_processor.non_audio_code_mask is not None
+                ):
+                    non_audio_mask = constrained_processor.non_audio_code_mask
+                    if non_audio_mask.device != device or non_audio_mask.dtype != torch.float32:
+                        non_audio_mask = non_audio_mask.to(device=device, dtype=torch.float32)
+                    # valid_mask is True where tokens are allowed (mask value == 0)
+                    valid_mask = (non_audio_mask[0] == 0)  # [vocab_size]
+                    valid_indices = valid_mask.nonzero(as_tuple=False).squeeze(1)  # [num_valid]
 
-                # Apply constrained processor FIRST (modifies logits based on FSM state)
+                    # CFG on valid tokens only; all others get -inf
+                    cond_valid = cond_logits[:, valid_indices].float()
+                    uncond_valid = uncond_logits[:, valid_indices].float()
+                    cfg_valid = uncond_valid + cfg_scale * (cond_valid - uncond_valid)
+
+                    cfg_logits = torch.full(
+                        (batch_size, cond_logits.shape[1]),
+                        float('-inf'),
+                        device=device,
+                        dtype=torch.float32,
+                    )
+                    cfg_logits[:, valid_indices] = cfg_valid
+                else:
+                    # Apply CFG formula: cfg_logits = uncond + cfg_scale * (cond - uncond)
+                    # Upcast to float32 to prevent overflow in float16 (CFG scaling can exceed fp16 range)
+                    cfg_logits = uncond_logits.float() + cfg_scale * (cond_logits.float() - uncond_logits.float())
+                    # Guard against NaN from (-inf) + scale * ((-inf) - (-inf)).
+                    # This can happen when repetition penalty drives a token to -inf in both
+                    # cond and uncond branches simultaneously.  Replace NaN with -inf so those
+                    # tokens are simply excluded from sampling.
+                    cfg_logits = torch.nan_to_num(cfg_logits, nan=float('-inf'))
+
+                # Apply constrained processor (modifies logits based on FSM state, e.g. duration constraint)
                 if constrained_processor is not None:
                     current_input_ids = generated_ids[cond_start_idx:cond_start_idx+batch_size]
                     cfg_logits = constrained_processor(current_input_ids, cfg_logits)
@@ -2506,16 +2697,24 @@ class LLMHandler:
                 cfg_logits = self._apply_top_k_filter(cfg_logits, top_k)
                 cfg_logits = self._apply_top_p_filter(cfg_logits, top_p)
 
+                # Force EOS for already-finished sequences so they don't alter constrained state
+                if seq_finished.any():
+                    for b in range(batch_size):
+                        if seq_finished[b]:
+                            cfg_logits[b, :] = float('-inf')
+                            cfg_logits[b, eos_token_id] = 0.0
+
                 # Apply temperature and sample
                 next_tokens = self._sample_tokens(cfg_logits, temperature)
 
                 # Update constrained processor state AFTER sampling
                 self._update_constrained_processor_state(constrained_processor, next_tokens)
 
-                # Check for EOS token in conditional sequences BEFORE unsqueezing
-                # Stop if any conditional sequence generates EOS token
-                # next_tokens shape: [batch_size] (only conditional tokens)
-                should_stop = self._check_eos_token(next_tokens, eos_token_id, pad_token_id)
+                # Per-sequence EOS tracking (Fix 4: stop when ALL sequences are done)
+                is_eos = next_tokens == eos_token_id
+                if pad_token_id is not None and pad_token_id != eos_token_id:
+                    is_eos = is_eos | (next_tokens == pad_token_id)
+                seq_finished = seq_finished | is_eos
 
                 # Apply the same sampled tokens to both conditional and unconditional sequences
                 next_tokens_unsqueezed = next_tokens.unsqueeze(1)
@@ -2531,12 +2730,15 @@ class LLMHandler:
                 if streamer is not None:
                     streamer.put(next_tokens_unsqueezed)  # Stream conditional tokens
 
-                # Stop generation if EOS token detected
-                if should_stop:
+                # Stop generation only when ALL sequences have finished
+                if seq_finished.all():
                     break
 
         if streamer is not None:
             streamer.end()
+
+        # Explicitly free KV cache to reduce memory fragmentation
+        del past_key_values
 
         # Return the full batch (both conditional and unconditional)
         # The caller will extract only the conditional output
@@ -3897,6 +4099,7 @@ class LLMHandler:
             if hasattr(model, "to"):
                 model.to("cpu")
             # Clear accelerator cache after offloading
+            gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             elif hasattr(torch, 'xpu') and torch.xpu.is_available():

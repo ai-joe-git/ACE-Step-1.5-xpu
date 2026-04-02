@@ -1,5 +1,6 @@
 """Decode/validation helpers for ``generate_music`` orchestration."""
 
+import gc
 import os
 import time
 from typing import Any, Dict, Optional, Tuple
@@ -64,12 +65,20 @@ class GenerateMusicDecodeMixin:
         logger.debug(f"[generate_music] time_costs: {time_costs}")
 
         if torch.isnan(pred_latents).any() or torch.isinf(pred_latents).any():
-            raise RuntimeError(
-                "Generation produced NaN or Inf latents. "
-                "This usually indicates a checkpoint/config mismatch "
-                "or unsupported quantization/backend combination. "
-                "Try running with --backend pt or verify your model checkpoints match this release."
-            )
+            nan_count = torch.isnan(pred_latents).sum().item()
+            inf_count = torch.isinf(pred_latents).sum().item()
+            hints = [
+                f"Generation produced NaN or Inf latents "
+                f"(shape={list(pred_latents.shape)}, dtype={pred_latents.dtype}, "
+                f"device={pred_latents.device}, nan={nan_count}, inf={inf_count}).",
+                "Common causes and fixes:",
+                "  1. LoRA/adapter trained on an older model version — retrain or update the adapter.",
+                "  2. Checkpoint/config mismatch — verify model checkpoints match this release.",
+                "  3. Unsupported quantization/backend — try running with --backend pt.",
+                "  4. CPU offload left parameters on wrong device — restart and regenerate.",
+                "  5. Float16 overflow on pre-Ampere GPU — set ACESTEP_DTYPE=float32.",
+            ]
+            raise RuntimeError("\n".join(hints))
         if pred_latents.numel() > 0 and pred_latents.abs().sum() == 0:
             raise RuntimeError(
                 "Generation produced zero latents. "
@@ -180,7 +189,6 @@ class GenerateMusicDecodeMixin:
                     if vae_cpu and vae_device is not None:
                         logger.info("[generate_music] Restoring VAE to original device after CPU decode path...")
                         self.vae = self.vae.to(vae_device)
-                        pred_latents_for_decode = pred_latents_for_decode.to(vae_device)
                     self._empty_cache()
                 logger.debug(
                     "[generate_music] After VAE decode: "
@@ -194,6 +202,8 @@ class GenerateMusicDecodeMixin:
                 if torch.any(peak > 1.0):
                     pred_wavs = pred_wavs / peak.clamp(min=1.0)
                 self._empty_cache()
+        gc.collect()
+        self._empty_cache()
         end_time = time.time()
         time_costs["vae_decode_time_cost"] = end_time - start_time
         time_costs["total_time_cost"] = time_costs["total_time_cost"] + time_costs["vae_decode_time_cost"]

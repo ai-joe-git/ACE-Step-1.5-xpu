@@ -7,6 +7,7 @@ backward-compatible Gradio UI support.
 """
 
 import math
+import inspect
 import os
 import tempfile
 from typing import Optional, Union, List, Dict, Any, Tuple
@@ -15,7 +16,8 @@ from loguru import logger
 import torch
 
 
-from acestep.audio_utils import AudioSaver, generate_uuid_from_params, normalize_audio, get_lora_weights_hash
+from acestep.audio_utils import AudioSaver, apply_fade, generate_uuid_from_params, normalize_audio, get_lora_weights_hash
+from acestep.constants import BPM_MIN, BPM_MAX, DURATION_MAX, TASK_TYPES, VALID_TIME_SIGNATURES
 
 # HuggingFace Space environment detection
 IS_HUGGINGFACE_SPACE = os.environ.get("SPACE_ID") is not None
@@ -103,6 +105,7 @@ class GenerationParams:
 
     # Text Inputs
     caption: str = ""
+    global_caption: str = ""  # Global/song-level caption for SFT-stems lego tasks
     lyrics: str = ""
     instrumental: bool = False
 
@@ -116,6 +119,8 @@ class GenerationParams:
     # Audio Post-Processing
     enable_normalization: bool = True
     normalization_db: float = -1.0
+    fade_in_duration: float = 0.0   # Fade in duration in seconds. 0 = no fade in.
+    fade_out_duration: float = 0.0  # Fade out duration in seconds. 0 = no fade out.
 
     # Latent Post-Processing (before VAE decode)
     latent_shift: float = 0.0       # Additive shift on DiT latents. Default 0 = no shift.
@@ -130,12 +135,20 @@ class GenerationParams:
     cfg_interval_end: float = 1.0
     shift: float = 1.0
     infer_method: str = "ode"  # "ode" or "sde" - diffusion inference method
+    sampler_mode: str = "euler"  # "euler" (first-order) or "heun" (second-order predictor-corrector)
+    velocity_norm_threshold: float = 0.0  # Clamp velocity prediction norms (0 = disabled, try 2.0)
+    velocity_ema_factor: float = 0.0  # Velocity EMA smoothing (0 = disabled, try 0.1)
     # Custom timesteps (parsed from string like "0.97,0.76,0.615,0.5,0.395,0.28,0.18,0.085,0")
     # If provided, overrides inference_steps and shift
     timesteps: Optional[List[float]] = None
 
     repainting_start: float = 0.0
     repainting_end: float = -1
+    chunk_mask_mode: str = "auto"  # "explicit" = 0/1 mask from repaint range; "auto" = all 2.0 (model decides)
+    repaint_latent_crossfade_frames: int = 10  # latent-level boundary blend width (25Hz frames, 10≈0.4s)
+    repaint_wav_crossfade_sec: float = 0.0  # waveform-level splice crossfade (seconds, 0=hard cut)
+    repaint_mode: str = "balanced"  # "conservative", "balanced", or "aggressive"
+    repaint_strength: float = 0.5  # 0.0=aggressive, 1.0=conservative (balanced mode only)
     audio_cover_strength: float = 1.0
     cover_noise_strength: float = 0.0  # 0=pure noise (no cover), 1=closest to src audio
 
@@ -160,6 +173,121 @@ class GenerationParams:
     cot_caption: str = ""
     cot_lyrics: str = ""
 
+    def __post_init__(self):
+        """Validate and clamp parameters to safe ranges."""
+        # --- Hard validation (raise on truly invalid values) ---
+        if self.sampler_mode not in ("euler", "heun"):
+            raise ValueError(
+                f"Invalid sampler_mode '{self.sampler_mode}'. Must be 'euler' or 'heun'."
+            )
+        if self.infer_method not in ("ode", "sde"):
+            raise ValueError(
+                f"Invalid infer_method '{self.infer_method}'. Must be 'ode' or 'sde'."
+            )
+        if self.task_type not in TASK_TYPES:
+            raise ValueError(
+                f"Invalid task_type '{self.task_type}'. Must be one of {TASK_TYPES}."
+            )
+        if self.velocity_norm_threshold < 0:
+            raise ValueError(
+                f"velocity_norm_threshold must be >= 0, got {self.velocity_norm_threshold}"
+            )
+        if not (0 <= self.velocity_ema_factor <= 1.0):
+            raise ValueError(
+                f"velocity_ema_factor must be in [0, 1.0], got {self.velocity_ema_factor}"
+            )
+
+        # --- Soft clamping (clamp to safe range with warning) ---
+        if self.inference_steps < 1:
+            logger.warning(
+                "inference_steps={} is invalid, clamping to 1.", self.inference_steps,
+            )
+            self.inference_steps = 1
+        elif self.inference_steps > 200:
+            logger.warning(
+                "inference_steps={} exceeds maximum, clamping to 200.", self.inference_steps,
+            )
+            self.inference_steps = 200
+
+        if self.guidance_scale < 0.0:
+            logger.warning(
+                "guidance_scale={:.2f} is negative, clamping to 0.0.", self.guidance_scale,
+            )
+            self.guidance_scale = 0.0
+        elif self.guidance_scale > 20.0:
+            logger.warning(
+                "guidance_scale={:.2f} exceeds maximum, clamping to 20.0.", self.guidance_scale,
+            )
+            self.guidance_scale = 20.0
+
+        if self.duration == 0.0:
+            logger.warning(
+                "duration=0.0 is not valid (use -1 for auto), resetting to auto (-1).",
+            )
+            self.duration = -1.0
+        elif 0 < self.duration < 1.0:
+            logger.warning(
+                "duration={:.1f}s is below minimum, clamping to 1s.", self.duration,
+            )
+            self.duration = 1.0
+        elif self.duration > DURATION_MAX:
+            logger.warning(
+                "duration={:.1f}s exceeds maximum, clamping to {}s.", self.duration, DURATION_MAX,
+            )
+            self.duration = float(DURATION_MAX)
+
+        if self.bpm is not None:
+            if self.bpm < BPM_MIN:
+                logger.warning(
+                    "bpm={} is below minimum, clamping to {}.", self.bpm, BPM_MIN,
+                )
+                self.bpm = BPM_MIN
+            elif self.bpm > BPM_MAX:
+                logger.warning(
+                    "bpm={} exceeds maximum, clamping to {}.", self.bpm, BPM_MAX,
+                )
+                self.bpm = BPM_MAX
+
+        if self.timesignature not in ("", "auto"):
+            try:
+                ts_int = int(self.timesignature)
+                if ts_int not in VALID_TIME_SIGNATURES:
+                    logger.warning(
+                        "timesignature={} is invalid (valid: {}), resetting to auto.",
+                        self.timesignature, VALID_TIME_SIGNATURES,
+                    )
+                    self.timesignature = ""
+            except (ValueError, TypeError):
+                logger.warning(
+                    "timesignature='{}' is not a valid integer, resetting to auto.",
+                    self.timesignature,
+                )
+                self.timesignature = ""
+
+        if self.shift <= 0.0:
+            logger.warning(
+                "shift={:.3f} is invalid (must be > 0), clamping to 0.1.", self.shift,
+            )
+            self.shift = 0.1
+
+        self.audio_cover_strength = max(0.0, min(1.0, self.audio_cover_strength))
+        self.cover_noise_strength = max(0.0, min(1.0, self.cover_noise_strength))
+        self.cfg_interval_start = max(0.0, min(1.0, self.cfg_interval_start))
+        self.cfg_interval_end = max(0.0, min(1.0, self.cfg_interval_end))
+        if self.cfg_interval_start > self.cfg_interval_end:
+            logger.warning(
+                "cfg_interval_start={:.2f} > cfg_interval_end={:.2f}, swapping to restore valid window.",
+                self.cfg_interval_start, self.cfg_interval_end,
+            )
+            self.cfg_interval_start, self.cfg_interval_end = self.cfg_interval_end, self.cfg_interval_start
+
+        if self.repainting_end >= 0 and self.repainting_start > self.repainting_end:
+            logger.warning(
+                "repainting_start={:.2f} > repainting_end={:.2f}, swapping to restore valid window.",
+                self.repainting_start, self.repainting_end,
+            )
+            self.repainting_start, self.repainting_end = self.repainting_end, self.repainting_start
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert config to dictionary for JSON serialization."""
         return asdict(self)
@@ -180,6 +308,8 @@ class GenerationConfig:
         lm_batch_chunk_size: Batch chunk size for LM processing
         constrained_decoding_debug: Whether to enable constrained decoding debug
         audio_format: Output audio format, one of "mp3", "wav", "flac", "wav32", "opus", "aac". Default: "flac"
+        mp3_bitrate: MP3 bitrate used when audio_format="mp3". Default: "128k"
+        mp3_sample_rate: MP3 output sample rate used when audio_format="mp3". Default: 48000
     """
     batch_size: int = 2
     allow_lm_batch: bool = False
@@ -188,6 +318,8 @@ class GenerationConfig:
     lm_batch_chunk_size: int = 8
     constrained_decoding_debug: bool = False
     audio_format: str = "flac"  # Default to FLAC for fast saving
+    mp3_bitrate: str = "128k"
+    mp3_sample_rate: int = 48000
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert config to dictionary for JSON serialization."""
@@ -384,9 +516,11 @@ def generate_music(
         actual_seed_list, _ = dit_handler.prepare_seeds(actual_batch_size, seed_for_generation, config.use_random_seed)
 
         # LM-based Chain-of-Thought reasoning
-        # Skip LM for cover/repaint tasks - these tasks use reference/src audio directly
-        # and don't need LM to generate audio codes
-        skip_lm_tasks = {"cover", "repaint"}
+        # Skip LM for cover/repaint/extract tasks - these tasks use reference/src audio directly
+        # and don't need LM to generate audio codes or metadata.
+        # For extract tasks, LLM-generated captions can conflict with the extract instruction
+        # and cause the DiT model to reconstruct input audio instead of extracting stems.
+        skip_lm_tasks = {"cover", "repaint", "extract"}
         
         # Determine if we should use LLM
         # LLM is needed for:
@@ -569,49 +703,68 @@ def generate_music(
             if params.use_cot_language:
                 dit_input_vocal_language = lm_generated_metadata.get("vocal_language", dit_input_vocal_language)
 
-        # Repaint/cover: no LM run, so conditioning must come from params (caption + lyrics from GUI).
-        if params.task_type in ("repaint", "cover"):
+        # Repaint/cover/extract: no LM run, so conditioning must come from params (caption + lyrics from GUI).
+        if params.task_type in ("repaint", "cover", "extract"):
             dit_input_caption = params.caption or dit_input_caption
             dit_input_lyrics = params.lyrics if params.lyrics is not None else dit_input_lyrics
-            logger.info(f"[generate_music] Repaint/Cover task: using params.caption='{params.caption}', params.lyrics='{params.lyrics}'")
+            logger.info(f"[generate_music] {params.task_type} task: using params.caption='{params.caption}', params.lyrics='{params.lyrics}'")
             logger.info(f"[generate_music] Final inputs: dit_input_caption='{dit_input_caption}', dit_input_lyrics='{dit_input_lyrics}'")
 
         # Phase 2: DiT music generation
         # Use seed_for_generation (from config.seed or params.seed) instead of params.seed for actual generation
-        result = dit_handler.generate_music(
-            captions=dit_input_caption,
-            lyrics=dit_input_lyrics,
-            bpm=bpm,
-            key_scale=key_scale,
-            time_signature=time_signature,
-            vocal_language=dit_input_vocal_language,
-            inference_steps=params.inference_steps,
-            guidance_scale=params.guidance_scale,
-            use_random_seed=config.use_random_seed,
-            seed=seed_for_generation,  # Use config.seed (or params.seed fallback) instead of params.seed directly
-            reference_audio=params.reference_audio,
-            audio_duration=audio_duration,
-            batch_size=config.batch_size if config.batch_size is not None else 1,
+        dit_generate_kwargs = {
+            "captions": dit_input_caption,
+            "global_caption": params.global_caption,
+            "lyrics": dit_input_lyrics,
+            "bpm": bpm,
+            "key_scale": key_scale,
+            "time_signature": time_signature,
+            "vocal_language": dit_input_vocal_language,
+            "inference_steps": params.inference_steps,
+            "guidance_scale": params.guidance_scale,
+            "use_random_seed": config.use_random_seed,
+            "seed": seed_for_generation,  # Use config.seed (or params.seed fallback) instead of params.seed directly
+            "reference_audio": params.reference_audio,
+            "audio_duration": audio_duration,
+            "batch_size": config.batch_size if config.batch_size is not None else 1,
             # text2music (Custom mode) never uses src_audio; force None to
             # prevent stale UI values from leaking into generation.
-            src_audio=None if params.task_type == "text2music" else params.src_audio,
-            audio_code_string=audio_code_string_to_use,
-            repainting_start=params.repainting_start,
-            repainting_end=params.repainting_end,
-            instruction=params.instruction,
-            audio_cover_strength=params.audio_cover_strength,
-            cover_noise_strength=params.cover_noise_strength,
-            task_type=params.task_type,
-            use_adg=params.use_adg,
-            cfg_interval_start=params.cfg_interval_start,
-            cfg_interval_end=params.cfg_interval_end,
-            shift=params.shift,
-            infer_method=params.infer_method,
-            timesteps=params.timesteps,
-            latent_shift=params.latent_shift,
-            latent_rescale=params.latent_rescale,
-            progress=progress,
-        )
+            "src_audio": None if params.task_type == "text2music" else params.src_audio,
+            "audio_code_string": audio_code_string_to_use,
+            "repainting_start": params.repainting_start,
+            "repainting_end": params.repainting_end,
+            "chunk_mask_mode": params.chunk_mask_mode,
+            "repaint_latent_crossfade_frames": params.repaint_latent_crossfade_frames,
+            "repaint_wav_crossfade_sec": params.repaint_wav_crossfade_sec,
+            "repaint_mode": params.repaint_mode,
+            "repaint_strength": params.repaint_strength,
+            "instruction": params.instruction,
+            "audio_cover_strength": params.audio_cover_strength,
+            "cover_noise_strength": params.cover_noise_strength,
+            "task_type": params.task_type,
+            "use_adg": params.use_adg,
+            "cfg_interval_start": params.cfg_interval_start,
+            "cfg_interval_end": params.cfg_interval_end,
+            "shift": params.shift,
+            "infer_method": params.infer_method,
+            "sampler_mode": params.sampler_mode,
+            "velocity_norm_threshold": params.velocity_norm_threshold,
+            "velocity_ema_factor": params.velocity_ema_factor,
+            "timesteps": params.timesteps,
+            "latent_shift": params.latent_shift,
+            "latent_rescale": params.latent_rescale,
+            "progress": progress,
+        }
+        supported_generate_keys = set(inspect.signature(dit_handler.generate_music).parameters.keys())
+        filtered_generate_kwargs = {
+            key: value for key, value in dit_generate_kwargs.items() if key in supported_generate_keys
+        }
+        dropped_generate_keys = sorted(set(dit_generate_kwargs.keys()) - supported_generate_keys)
+        if dropped_generate_keys:
+            logger.warning(
+                f"[generate_music] Skipping unsupported generate_music kwargs: {dropped_generate_keys}"
+            )
+        result = dit_handler.generate_music(**filtered_generate_kwargs)
 
         # Check if generation failed
         if not result.get("success", False):
@@ -636,7 +789,7 @@ def generate_music(
         base_params_dict = params.to_dict()
 
         # Save audio files using AudioSaver (format from config)
-        audio_format = config.audio_format if config.audio_format else "flac"
+        audio_format = str(config.audio_format).strip().lower() if config.audio_format else "flac"
         audio_saver = AudioSaver(default_format=audio_format)
 
         # Use handler's temp_dir for saving files
@@ -665,6 +818,10 @@ def generate_music(
             audio_params["use_lora"] = dit_handler.use_lora
             audio_params["lora_scale"] = dit_handler.lora_scale
             audio_params["lora_weights_hash"] = get_lora_weights_hash(dit_handler)
+            audio_params["audio_format"] = audio_format
+            if audio_format == "mp3":
+                audio_params["mp3_bitrate"] = getattr(config, "mp3_bitrate", "128k")
+                audio_params["mp3_sample_rate"] = getattr(config, "mp3_sample_rate", 48000)
 
             # Get audio tensor and metadata
             audio_tensor = dit_audio.get("tensor")
@@ -687,6 +844,21 @@ def generate_music(
                      logger.error(f"Normalization failed: {e}")
             # -------------------------------
 
+            # --- FADE IN / FADE OUT ---
+            if params.fade_in_duration > 0.0 or params.fade_out_duration > 0.0:
+                try:
+                    fade_in_samples = round(params.fade_in_duration * sample_rate)
+                    fade_out_samples = round(params.fade_out_duration * sample_rate)
+                    audio_tensor = apply_fade(audio_tensor, fade_in_samples, fade_out_samples)
+                    logger.info(
+                        f"[Fade] Audio {idx}: fade_in={params.fade_in_duration:.2f}s "
+                        f"({fade_in_samples} samples), fade_out={params.fade_out_duration:.2f}s "
+                        f"({fade_out_samples} samples)"
+                    )
+                except Exception as e:
+                    logger.error(f"Fade application failed: {e}")
+            # --------------------------
+
             # Generate UUID for this audio (moved from handler)
             batch_seed = seed_list[idx] if idx < len(seed_list) else seed_list[0] if seed_list else -1
 
@@ -705,12 +877,13 @@ def generate_music(
                     # Handle wav32 special case for extension
                     file_ext = "wav" if audio_format == "wav32" else audio_format
                     audio_file = os.path.join(save_dir, f"{audio_key}.{file_ext}")
-                    
                     audio_path = audio_saver.save_audio(audio_tensor,
                                                         audio_file,
                                                         sample_rate=sample_rate,
                                                         format=audio_format,
-                                                        channels_first=True)
+                                                        channels_first=True,
+                                                        mp3_bitrate=getattr(config, "mp3_bitrate", "128k"),
+                                                        mp3_sample_rate=getattr(config, "mp3_sample_rate", 48000))
                 except Exception as e:
                     logger.error(f"[generate_music] Failed to save audio file: {e}")
                     audio_path = ""  # Fallback to empty path
